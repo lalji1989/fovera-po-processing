@@ -94,7 +94,13 @@ Resources:`;for(let t of c){if(!t||typeof t!=`string`)throw Error(`@supabase/aut
 
   const params = new URLSearchParams(location.search);
   const next = params.get('next') && params.get('next').startsWith('/') ? params.get('next') : '/';
-  if (params.get('reason') === 'expired') show('Your session expired. Sign in again to continue.', 'err');
+
+  /* The middleware sent us back because it refused the cookie. If we still hold a
+     Supabase session, the auto-redirect below would set the cookie and walk straight
+     back into the same refusal — an endless bounce that never lets anyone reach the
+     form. So on a bounce we hold position, drop the stale session, and explain. */
+  const bounced = params.get('reason') === 'expired';
+  let holdRedirect = bounced;    // cleared the moment the user actively signs in
 
   /* Arriving from a password-reset email. The recovery token creates a real session,
      so the usual "session exists -> go to the app" shortcut has to stand down until
@@ -110,8 +116,13 @@ Resources:`;for(let t of c){if(!t||typeof t!=`string`)throw Error(`@supabase/aut
       '; Path=/; Max-Age=' + maxAge + '; SameSite=Lax' + secure;
   }
 
+  function clearCookie() {
+    document.cookie = 'sb-access-token=; Path=/; Max-Age=0; SameSite=Lax' +
+      (location.protocol === 'https:' ? '; Secure' : '');
+  }
+
   async function land() {
-    if (recovering) return false;
+    if (recovering || holdRedirect) return false;
     const { data } = await sb.auth.getSession();
     if (data && data.session) {
       setCookie(data.session);
@@ -124,10 +135,33 @@ Resources:`;for(let t of c){if(!t||typeof t!=`string`)throw Error(`@supabase/aut
 
   sb.auth.onAuthStateChange((_e, session) => {
     if (!session) return;
-    setCookie(session);            // cookie is wanted either way
-    if (!recovering) go(next);     // but hold on the page while resetting a password
+    setCookie(session);                            // cookie is wanted either way
+    if (!recovering && !holdRedirect) go(next);    // but hold while resetting, or after a bounce
   });
-  land();
+
+  /* Say WHY the server refused us, rather than a vague "expired". The token is
+     decoded header-only and never trusted — it just tells us which signing
+     algorithm Supabase used, which is the usual mismatch. */
+  async function explainBounce() {
+    let msg = 'Your session expired. Sign in again to continue.';
+    try {
+      const { data } = await sb.auth.getSession();
+      const tok = data && data.session && data.session.access_token;
+      if (tok) {
+        let alg = '';
+        try {
+          alg = JSON.parse(atob(tok.split('.')[0].replace(/-/g, '+').replace(/_/g, '/'))).alg || '';
+        } catch (_) {}
+        msg = (alg && alg !== 'HS256')
+          ? `Signed in, but the server rejected the session: this project signs tokens with ${alg} while the server verifies HS256.`
+          : 'Signed in, but the server rejected the session. The SUPABASE_JWT_SECRET on Cloudflare does not match this Supabase project.';
+        clearCookie();
+        await sb.auth.signOut().catch(() => {});   // break the bounce for good
+      }
+    } catch (_) {}
+    show(msg, 'err');
+  }
+  if (bounced) explainBounce(); else land();
 
   /* Email + password sign-in. The account must already exist in Supabase with a
      password set (Authentication -> Users). Sign-up is not offered here — access
@@ -138,6 +172,7 @@ Resources:`;for(let t of c){if(!t||typeof t!=`string`)throw Error(`@supabase/aut
     const email = document.querySelector('#email').value.trim();
     const password = document.querySelector('#pw').value;
     if (!email || !password) return;
+    holdRedirect = false;          // an explicit sign-in should navigate on success
     btn.disabled = true; btn.textContent = 'Signing in…';
     const { error } = await sb.auth.signInWithPassword({ email, password });
     btn.disabled = false; btn.textContent = 'Sign in';
