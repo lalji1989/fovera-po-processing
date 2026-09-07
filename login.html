@@ -35,6 +35,12 @@ button:disabled{opacity:.55;cursor:default}
 .msg.ok{background:rgba(13,138,95,.09);border:1px solid #a9dcc6;color:var(--key)}
 .msg.err{background:rgba(196,52,74,.07);border:1px solid #eec2c8;color:var(--bad)}
 .foot{margin-top:20px;font-size:11.5px;color:var(--dim);text-align:center;line-height:1.6}
+/* password row: label on the left, "forgot" affordance on the right */
+.pwrow{display:flex;align-items:baseline;justify-content:space-between;margin-top:14px}
+.pwrow label{margin-bottom:6px}
+.linkbtn{width:auto;margin:0;padding:0;background:none;border:none;color:var(--brand);
+  font:inherit;font-size:11px;font-weight:600;cursor:pointer;text-decoration:underline}
+.linkbtn:hover:not(:disabled){filter:brightness(.85)}
 </style></head>
 <body>
 <div class="card">
@@ -43,8 +49,13 @@ button:disabled{opacity:.55;cursor:default}
   <p class="sub">Sign in with your work email to continue</p>
   <form id="f" autocomplete="on">
     <label for="email">Email address</label>
-    <input id="email" type="email" required placeholder="you@fovera.com" autocomplete="email">
-    <button id="go" type="submit">Send me a sign-in link</button>
+    <input id="email" type="email" required placeholder="you@fovera.com" autocomplete="username">
+    <div class="pwrow">
+      <label for="pw">Password</label>
+      <button type="button" id="forgot" class="linkbtn">Forgot password?</button>
+    </div>
+    <input id="pw" type="password" required placeholder="••••••••" autocomplete="current-password">
+    <button id="go" type="submit">Sign in</button>
   </form>
   <div id="msg" class="msg"></div>
   <p class="foot">Access is invite-only. If your address isn't recognised,<br>ask Ayush to add you.</p>
@@ -85,6 +96,11 @@ Resources:`;for(let t of c){if(!t||typeof t!=`string`)throw Error(`@supabase/aut
   const next = params.get('next') && params.get('next').startsWith('/') ? params.get('next') : '/';
   if (params.get('reason') === 'expired') show('Your session expired. Sign in again to continue.', 'err');
 
+  /* Arriving from a password-reset email. The recovery token creates a real session,
+     so the usual "session exists -> go to the app" shortcut has to stand down until
+     the new password is saved. */
+  const recovering = location.hash.includes('type=recovery') || params.get('mode') === 'reset';
+
   /* The edge middleware reads this cookie. SameSite=Lax so it survives the
      redirect back from the email link; Secure because Pages is always HTTPS. */
   function setCookie(session) {
@@ -95,6 +111,7 @@ Resources:`;for(let t of c){if(!t||typeof t!=`string`)throw Error(`@supabase/aut
   }
 
   async function land() {
+    if (recovering) return false;
     const { data } = await sb.auth.getSession();
     if (data && data.session) {
       setCookie(data.session);
@@ -105,29 +122,83 @@ Resources:`;for(let t of c){if(!t||typeof t!=`string`)throw Error(`@supabase/aut
     return false;
   }
 
-  sb.auth.onAuthStateChange((_e, session) => { if (session) { setCookie(session); go(next); } });
+  sb.auth.onAuthStateChange((_e, session) => {
+    if (!session) return;
+    setCookie(session);            // cookie is wanted either way
+    if (!recovering) go(next);     // but hold on the page while resetting a password
+  });
   land();
 
+  /* Email + password sign-in. The account must already exist in Supabase with a
+     password set (Authentication -> Users). Sign-up is not offered here — access
+     stays invite-only. */
   form.addEventListener('submit', async e => {
     e.preventDefault();
+    if (recovering) return;        // the recovery handler below owns the form instead
     const email = document.querySelector('#email').value.trim();
-    if (!email) return;
-    btn.disabled = true; btn.textContent = 'Sending…';
-    const redirectTo = location.origin + '/login.html' + (next !== '/' ? '?next=' + encodeURIComponent(next) : '');
-    const { error } = await sb.auth.signInWithOtp({
-      email,
-      options: { emailRedirectTo: redirectTo, shouldCreateUser: false }
-    });
-    btn.disabled = false; btn.textContent = 'Send me a sign-in link';
+    const password = document.querySelector('#pw').value;
+    if (!email || !password) return;
+    btn.disabled = true; btn.textContent = 'Signing in…';
+    const { error } = await sb.auth.signInWithPassword({ email, password });
+    btn.disabled = false; btn.textContent = 'Sign in';
     if (error) {
-      const m = /not.*allow|signup|user/i.test(error.message)
-        ? 'That address has not been invited. Ask Ayush to add you in Supabase.'
-        : error.message;
+      const raw = error.message || '';
+      let m = raw;
+      if (/invalid login credentials/i.test(raw))
+        m = 'Wrong email or password. Check both and try again.';
+      else if (/email not confirmed/i.test(raw))
+        m = 'This account has not been confirmed yet. Ask Ayush to confirm it in Supabase.';
+      else if (/too many requests|rate limit/i.test(raw))
+        m = 'Too many attempts. Wait a minute and try again.';
       show(m, 'err');
-    } else {
-      show('Check your inbox — the link signs you straight in. It expires in about an hour.', 'ok');
     }
+    // On success onAuthStateChange sets the cookie and navigates — nothing to do here.
   });
+
+  /* Password reset. Sends a Supabase recovery email; the link lands back on this
+     page with a recovery token, which puts the client into a session where the
+     user can set a new password. */
+  const forgot = document.querySelector('#forgot');
+  if (forgot) forgot.addEventListener('click', async () => {
+    const email = document.querySelector('#email').value.trim();
+    if (!email) { show('Type your email address above first, then click Forgot password.', 'err'); return; }
+    forgot.disabled = true;
+    const { error } = await sb.auth.resetPasswordForEmail(email, {
+      redirectTo: location.origin + '/login.html?mode=reset'
+    });
+    forgot.disabled = false;
+    show(error ? (error.message || 'Could not send the reset email.')
+               : 'Reset link sent. Check your inbox — it expires in about an hour.',
+         error ? 'err' : 'ok');
+  });
+
+  /* Coming back from a recovery link: swap the form over to "set a new password". */
+  if (recovering) {
+    const emailIn = document.querySelector('#email');
+    const emailLbl = document.querySelector('label[for="email"]');
+    const pwIn = document.querySelector('#pw');
+    document.querySelector('.sub').textContent = 'Choose a new password';
+    if (emailIn)  emailIn.style.display = 'none';
+    if (emailIn)  emailIn.required = false;
+    if (emailLbl) emailLbl.style.display = 'none';
+    if (forgot)   forgot.style.display = 'none';
+    pwIn.setAttribute('autocomplete', 'new-password');
+    pwIn.placeholder = 'New password (min 6 characters)';
+    btn.textContent = 'Save new password';
+    form.onsubmit = async ev => {
+      ev.preventDefault();
+      const password = pwIn.value;
+      if (!password || password.length < 6) { show('Password must be at least 6 characters.', 'err'); return; }
+      btn.disabled = true; btn.textContent = 'Saving…';
+      const { error } = await sb.auth.updateUser({ password });
+      btn.disabled = false; btn.textContent = 'Save new password';
+      if (error) { show(error.message || 'Could not update the password.', 'err'); return; }
+      show('Password updated. Signing you in…', 'ok');
+      const { data } = await sb.auth.getSession();
+      if (data && data.session) setCookie(data.session);
+      setTimeout(() => go(next), 900);
+    };
+  }
 })();
 </script>
 </body></html>
