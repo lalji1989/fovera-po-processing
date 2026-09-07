@@ -19,7 +19,7 @@
  *   ALLOWED_DOMAIN       — optional, e.g. "fovera.com"
  */
 
-const SUPABASE_URL_DEFAULT = 'https://kgqcjleyxlsluyvljhke.supabase.co';
+const SUPABASE_URL_DEFAULT = 'https://isvzfmuxudcxofcfrmfr.supabase.co';
 
 const PUBLIC_PATHS = ['/login', '/login.html', '/auth-callback', '/auth-callback.html', '/favicon.ico'];
 
