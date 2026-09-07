@@ -1846,53 +1846,138 @@ async function idbPut(k, v) {
     tx.onerror = () => rej(tx.error);
   });
 }
-/* Debounced writer — a burst of edits collapses into a single write once things settle. */
-let _saveT = null;
+/* Build the state payload once, so the local (IndexedDB) writer and the cloud
+   writer send the same shape. `updated_at` breaks ties on multi-device sync. */
+function _buildPayload() {
+  const p = {
+    version: 1,
+    updated_at: new Date().toISOString(),
+    cfg: S.cfg, theme: S.theme, active: S.active,
+    shared: { drr: S.shared.drr, meta: S.shared.meta },
+    vendors: {}
+  };
+  VENDORS.forEach(v => {
+    const V = S.vendors[v.id];
+    p.vendors[v.id] = {
+      raw: { confirmed: V.raw.confirmed, unconfirmed: V.raw.unconfirmed, inventory: V.raw.inventory },
+      meta: V.meta, nowCode: V.nowCode,
+      overrides: V.overrides ? [...V.overrides] : []
+    };
+  });
+  return p;
+}
+/* Apply a loaded payload onto S. Works for both IDB and cloud payloads. */
+function _applyPayload(p) {
+  if (!p || p.version !== 1) return false;
+  Object.assign(S.cfg, p.cfg || {});
+  if (p.theme)  S.theme  = p.theme;
+  if (p.active) S.active = p.active;
+  if (p.shared) {
+    if (p.shared.drr)  S.shared.drr  = p.shared.drr;
+    if (p.shared.meta) S.shared.meta = p.shared.meta;
+  }
+  Object.keys(p.vendors || {}).forEach(vid => {
+    const V = S.vendors[vid]; if (!V) return;
+    const src = p.vendors[vid];
+    if (src.raw) {
+      if (Array.isArray(src.raw.confirmed))   V.raw.confirmed   = src.raw.confirmed;
+      if (Array.isArray(src.raw.unconfirmed)) V.raw.unconfirmed = src.raw.unconfirmed;
+      if (Array.isArray(src.raw.inventory))   V.raw.inventory   = src.raw.inventory;
+    }
+    if (src.meta)    V.meta    = src.meta;
+    if (src.nowCode) V.nowCode = src.nowCode;
+    if (Array.isArray(src.overrides)) V.overrides = new Map(src.overrides);
+  });
+  return true;
+}
+/* Debounced writers. IDB is fast so we save it eagerly; the cloud push waits
+   a couple of seconds so a burst of edits (typing in cells, tweaking settings)
+   turns into a single upload. */
+let _saveT = null, _cloudT = null;
 function saveSession() {
   clearTimeout(_saveT);
   _saveT = setTimeout(() => {
-    const payload = {
-      version: 1,
-      cfg: S.cfg, theme: S.theme, active: S.active,
-      shared: { drr: S.shared.drr, meta: S.shared.meta },
-      vendors: {}
-    };
-    VENDORS.forEach(v => {
-      const V = S.vendors[v.id];
-      payload.vendors[v.id] = {
-        raw: { confirmed: V.raw.confirmed, unconfirmed: V.raw.unconfirmed, inventory: V.raw.inventory },
-        meta: V.meta, nowCode: V.nowCode,
-        overrides: V.overrides ? [...V.overrides] : []
-      };
-    });
-    idbPut('session', payload).catch(e => console.warn('[fovera] save failed:', e));
+    const payload = _buildPayload();
+    idbPut('session', payload).catch(e => console.warn('[fovera] IDB save failed:', e));
+    // Cloud upload piggybacks on the same payload once things settle a bit longer.
+    clearTimeout(_cloudT);
+    _cloudT = setTimeout(() => cloudSave(payload), 2000);
   }, 400);
 }
 async function loadSession() {
   try {
     const p = await idbGet('session');
-    if (!p || p.version !== 1) return false;
-    Object.assign(S.cfg, p.cfg || {});
-    if (p.theme)  S.theme  = p.theme;
-    if (p.active) S.active = p.active;
-    if (p.shared) {
-      if (p.shared.drr)  S.shared.drr  = p.shared.drr;
-      if (p.shared.meta) S.shared.meta = p.shared.meta;
+    return _applyPayload(p);
+  } catch (e) { console.warn('[fovera] IDB load failed:', e); return false; }
+}
+
+/* ---- Cloud sync via Supabase Storage (only in the hosted build) ---------
+   Bucket 'user-state' (private). Each user's file is stored at
+   '<user.id>/session.json'. RLS restricts read/write to the owner.
+   See the SETUP block at the end of this comment for the SQL. */
+const CLOUD_BUCKET = 'user-state';
+async function _sbReady() {
+  if (window.__sb) return window.__sb;
+  await new Promise(res => {
+    const done = () => { window.removeEventListener('fovera:sb-ready', done); res(); };
+    window.addEventListener('fovera:sb-ready', done);
+    setTimeout(done, 5000);   // never hang the app if we're not in the hosted build
+  });
+  return window.__sb || null;
+}
+async function _cloudUser() {
+  const sb = await _sbReady();
+  if (!sb) return { sb: null, user: null };
+  try {
+    const { data } = await sb.auth.getSession();
+    return { sb, user: data && data.session && data.session.user };
+  } catch { return { sb, user: null }; }
+}
+async function cloudSave(payload) {
+  try {
+    const { sb, user } = await _cloudUser();
+    if (!sb || !user) return;
+    const path = `${user.id}/session.json`;
+    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    const { error } = await sb.storage.from(CLOUD_BUCKET)
+      .upload(path, blob, { upsert: true, contentType: 'application/json', cacheControl: '0' });
+    if (error) console.warn('[fovera] cloud save failed:', error.message || error);
+  } catch (e) { console.warn('[fovera] cloud save failed:', e); }
+}
+async function cloudLoad() {
+  try {
+    const { sb, user } = await _cloudUser();
+    if (!sb || !user) return null;
+    const path = `${user.id}/session.json`;
+    const { data, error } = await sb.storage.from(CLOUD_BUCKET).download(path);
+    if (error) {
+      // 404 on first ever load is expected; anything else is worth noting
+      if (!/not found|object.*not.*found|404/i.test(error.message || '')) console.warn('[fovera] cloud load:', error.message || error);
+      return null;
     }
-    Object.keys(p.vendors || {}).forEach(vid => {
-      const V = S.vendors[vid]; if (!V) return;
-      const src = p.vendors[vid];
-      if (src.raw) {
-        if (Array.isArray(src.raw.confirmed))   V.raw.confirmed   = src.raw.confirmed;
-        if (Array.isArray(src.raw.unconfirmed)) V.raw.unconfirmed = src.raw.unconfirmed;
-        if (Array.isArray(src.raw.inventory))   V.raw.inventory   = src.raw.inventory;
-      }
-      if (src.meta)    V.meta    = src.meta;
-      if (src.nowCode) V.nowCode = src.nowCode;
-      if (Array.isArray(src.overrides)) V.overrides = new Map(src.overrides);
-    });
+    const text = await data.text();
+    const p = JSON.parse(text);
+    return p && p.version === 1 ? p : null;
+  } catch (e) { console.warn('[fovera] cloud load failed:', e); return null; }
+}
+/* On boot: after the fast IDB restore, pull the cloud copy in the background.
+   If it's newer, apply it and re-render; if local is newer, push it up. */
+async function cloudRefresh() {
+  const cloud = await cloudLoad();
+  if (!cloud) return false;
+  let local = null;
+  try { local = await idbGet('session'); } catch {}
+  const localAt = (local && local.updated_at) || '';
+  const cloudAt = cloud.updated_at || '';
+  if (cloudAt > localAt) {
+    _applyPayload(cloud);
+    await idbPut('session', cloud).catch(()=>{});
     return true;
-  } catch (e) { console.warn('[fovera] load failed:', e); return false; }
+  }
+  if (localAt > cloudAt && local) {
+    cloudSave(local);   // catch cloud up, fire and forget
+  }
+  return false;
 }
 
 function applyTheme() {
@@ -1920,6 +2005,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     $('#togglePanel').textContent = p.classList.contains('hide') ? 'Show uploads' : 'Hide uploads';
   };
   recompute(); render();
+  // Cross-device sync: after the fast local paint, pull the server copy in the
+  // background. If the cloud has newer data, adopt it and re-render.
+  cloudRefresh().then(changed => { if (changed) { recompute(); render(); } })
+                .catch(e => console.warn('[fovera] cloud refresh failed:', e));
 });
 </script>
 <script>/* Session guard — only present in the hosted build.
@@ -1936,6 +2025,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   const sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
     auth: { detectSessionInUrl: false, persistSession: true, autoRefreshToken: true }
   });
+  // Expose the client so the app script can push/pull the session to Supabase
+  // Storage (cross-device sync). It's only set when we're in the hosted build.
+  window.__sb = sb;
+  window.dispatchEvent(new Event('fovera:sb-ready'));
 
   const setCookie = s => {
     const maxAge = Math.max(60, (s.expires_at || 0) - Math.floor(Date.now() / 1000));
