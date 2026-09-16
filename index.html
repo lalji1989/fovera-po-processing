@@ -189,8 +189,16 @@ tr.grow td{background:var(--panel2);border-top:2px solid var(--line);border-bott
   padding:7px 10px;position:sticky}
 .gwrap{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .gleft{display:flex;align-items:center;gap:9px;min-width:0;flex:1}
-.gasin{font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:12.5px}
-.gsku{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--dim)}
+/* SKU is the code the warehouse and the BOM both speak, so it leads; the ASIN
+   stays visible beside it for Vendor Central lookups but recedes. */
+.gsku{font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:12.5px;color:var(--brand)}
+.gasin{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--dim)}
+.skucell{font-weight:700;color:var(--brand)}
+td.bandHigh{font-weight:700;color:#b42318;background:rgba(180,35,24,.08)}
+td.bandMedium{font-weight:600;color:#b54708;background:rgba(181,71,8,.07)}
+td.bandLow{color:var(--dim)}
+.idlelist{line-height:2;max-height:150px;overflow:auto}
+.uomtot{font-size:11px;white-space:nowrap}
 .gname{font-size:11.5px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:380px}
 .gright{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .chip{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:2px 9px;
@@ -874,11 +882,144 @@ function acceptBudgets(plan) {
   return m;
 }
 
+/* ==================== memory foam consumption ====================
+   What the accepted PO quantities will draw out of foam stock.
+
+   A SKU's BOM may list several foam codes (HM93_BK takes CX3-Plus + CX45 + CX18-M),
+   so every SKU expands to one row per component. "Nos" and "Pair" are different
+   physical things and are never summed into one figure — each foam code is totalled
+   within its own unit of measure.
+
+   Basis is `procTot`, the quantity the accept rules actually landed on (regular +
+   Amazon Now, after any manual override), not the quantity Amazon asked for. */
+const FOAM_INVIS = /[​-‏‪-‮﻿]/g;
+const foamKey = s => String(s == null ? '' : s).replace(FOAM_INVIS, '').trim().toUpperCase();
+
+function foamConsumption(plan, bom) {
+  const byRm = new Map();     // "RM unit" -> rollup row
+  const bySku = [];           // one row per SKU x component
+  const notFoam = [];         // accepted SKUs with no BOM entry
+  const seenSku = new Set();
+
+  plan.forEach(p => {
+    const qty = p.procTot || 0;
+    if (qty <= 0) return;
+    const k = foamKey(p.sku);
+    const comps = k && bom[k];
+    if (!comps) {
+      if (k || p.asin) notFoam.push({ asin: p.asin, sku: p.sku, name: p.name, procTot: qty });
+      return;
+    }
+    seenSku.add(k);
+    comps.forEach(([rm, per, unit]) => {
+      const need = qty * per;
+      bySku.push({ asin: p.asin, sku: p.sku, name: p.name, procTot: qty,
+                   rm, perUnit: per, unit, foamQty: need,
+                   procReg: p.procReg || 0, procNow: p.procNow || 0 });
+      const mk = rm + ' ' + unit;
+      if (!byRm.has(mk)) byRm.set(mk, { rm, unit, foamQty: 0, skus: 0, units: 0, skuList: [] });
+      const r = byRm.get(mk);
+      r.foamQty += need; r.skus++; r.units += qty; r.skuList.push(p.sku);
+    });
+  });
+
+  // BOM SKUs that carry no accepted quantity this cycle — visible so a missing
+  // upload or a declined line is obvious rather than silently absent.
+  const idle = Object.keys(bom).filter(k => !seenSku.has(k));
+
+  const rmRows = [...byRm.values()]
+    .map(r => ({ ...r, skuList: r.skuList.join(', ') }))
+    .sort((a, b) => b.foamQty - a.foamQty || a.rm.localeCompare(b.rm));
+  bySku.sort((a, b) => b.foamQty - a.foamQty || String(a.sku).localeCompare(String(b.sku)));
+  notFoam.sort((a, b) => b.procTot - a.procTot);
+
+  return { rmRows, skuRows: bySku, notFoam, idle };
+}
+
+/* ==================== dispatch priority ====================
+   The accept module decides HOW MUCH to take. This decides WHAT SHIPS FIRST.
+
+   Bucket is days-of-cover driven, on FC stock on hand over potential DRR:
+       DOC <= docHigh            -> High
+       docHigh < DOC <= docMed   -> Medium
+       DOC > docMed              -> Low
+   A SKU that sells but holds no stock has DOC 0 and lands at the top; a SKU with
+   no DRR at all cannot stock out on a run-rate basis and sits in Low.
+
+   Ordering inside a bucket is by money at risk, not by DOC, so that two SKUs both
+   three days from empty are separated by what the stockout would actually cost:
+       riskUnits = max(0, riskDays - DOC) * DRR    demand we could not serve
+       riskValue = riskUnits * unit cost           rupees of that demand
+   `score` blends urgency and value onto 0-100 purely to break ties legibly. */
+function dispatchPriority(plan, cfg) {
+  const hi   = Math.max(0, +cfg.docHigh  || 10);
+  const med  = Math.max(hi, +cfg.docMed  || 20);
+  const risk = Math.max(1, +cfg.riskDays || 30);
+
+  const rows = [];
+  plan.forEach(p => {
+    const qty = p.procTot || 0;
+    if (qty <= 0) return;                       // nothing accepted, nothing to dispatch
+    const drr = p.drr || 0;
+    const doc = drr > 0 ? (p.inventory || 0) / drr : null;
+
+    const band = doc == null ? 'Low' : doc <= hi ? 'High' : doc <= med ? 'Medium' : 'Low';
+    const shortDays = doc == null ? 0 : Math.max(0, risk - doc);
+    const riskUnits = shortDays * drr;
+    const cost      = p.cost || 0;
+    const riskValue = riskUnits * cost;
+
+    const urgency = doc == null ? 0 : Math.max(0, Math.min(1, 1 - doc / risk));
+
+    const why = [];
+    if (doc != null && doc <= hi)      why.push('Cover ' + dec1(doc) + 'd');
+    else if (doc != null && doc <= med) why.push('Cover ' + dec1(doc) + 'd');
+    if (drr <= 0)                      why.push('No DRR');
+    if (p.discontinued)                why.push('Discontinued');
+    if (p.progressing)                 why.push('Progressing');
+    if ((p.procNow || 0) > 0)          why.push('Amazon Now ' + fmt(p.procNow));
+    if ((p.openTot || 0) > 0)          why.push('Open PO ' + fmt(p.openTot));
+    if (riskValue > 0)                 why.push('At risk ' + Math.round(riskValue).toLocaleString('en-IN'));
+
+    rows.push({
+      asin: p.asin, sku: p.sku, name: p.name, vendorCode: p.vendorCode || '',
+      drr, inventory: p.inventory || 0, openTot: p.openTot || 0,
+      docSoh: doc, band,
+      procTot: qty, procReg: p.procReg || 0, procNow: p.procNow || 0,
+      cost, acceptValue: qty * cost,
+      shortDays, riskUnits, riskValue, urgency,
+      discontinued: !!p.discontinued, progressing: !!p.progressing,
+      status: p.status || '', why: why.join(' · ')
+    });
+  });
+
+  // score needs the whole set, so normalise value after the rows exist
+  let maxRisk = 0;
+  rows.forEach(r => { if (r.riskValue > maxRisk) maxRisk = r.riskValue; });
+  rows.forEach(r => {
+    const valueN = maxRisk > 0 ? r.riskValue / maxRisk : 0;
+    let s = 100 * (0.6 * r.urgency + 0.4 * valueN);
+    if (r.discontinued) s *= 0.25;              // dead stock never jumps the queue
+    if ((r.procNow || 0) > 0) s *= 1.15;        // Amazon Now carries the tighter SLA
+    r.score = Math.round(Math.max(0, Math.min(100, s)) * 10) / 10;
+  });
+
+  const rank = { High: 0, Medium: 1, Low: 2 };
+  rows.sort((a, b) => rank[a.band] - rank[b.band]
+                   || b.score - a.score
+                   || b.riskValue - a.riskValue
+                   || String(a.sku).localeCompare(String(b.sku)));
+  rows.forEach((r, i) => { r.rank = i + 1; });
+  return rows;
+}
+function dec1(n) { return (n == null || !isFinite(n)) ? '-' : Number(n).toFixed(1); }
+
 const CALC =
   { parsePO, parseDRR, parseInventory, buildPlan, applyOverrides, allocate, distribute, reconcile, normalisePriority, fcSummary, poSummary, diagnostics,
     splitDRR, resolveVendor,
     pickSheet, headerScore, PO_COLS, DRR_COLS, INV_COLS,
-    dispatchBudgets, acceptBudgets, parseDate, num, norm };
+    dispatchBudgets, acceptBudgets, parseDate, num, norm,
+    foamConsumption, dispatchPriority, foamKey };
 </script>
 <script>/* ==================== state ==================== */
 const VENDORS = [
@@ -886,13 +1027,177 @@ const VENDORS = [
   { id: 'RKWORLD',  label: 'RK WORLD', now: 'FPBE6', codes: ['FPBE6','G08VY','MM7CB'] },
   { id: 'RETAILEZ', label: 'RetailEz', now: '',      codes: ['6U980'] }
 ];
+/* ==================== memory foam BOM ====================
+   Source: "Memory Foam List for Order Planning .xlsx" (sheet BOM), 177 lines.
+   Shape: SKU code -> [[foam RM code, qty per finished unit, unit of measure], ...].
+   153 SKUs, 94 distinct foam codes. A SKU may draw on several foams
+   (e.g. HM93_BK needs CX3-Plus + CX45 + CX18-M), so the value is always a list.
+   Units are kept as authored - "Nos" and "Pair" are never added together.
+   Keys are upper-cased and stripped of the zero-width marks Excel left behind. */
+const FOAM_BOM = {
+  "CG_FO2":[["CX2-PUGEL",1,"Nos"]],
+  "CG_FO7":[["CX7-PUGEL",1,"Nos"]],
+  "CH901":[["FOM-FO92",1,"Nos"]],
+  "CH902":[["CX2-M-WH",1,"Nos"]],
+  "CH903":[["CX-64",1,"Nos"]],
+  "CH904":[["FOM-CH904",1,"Nos"]],
+  "CH904_H":[["FOM-CH904",1,"Nos"]],
+  "CH905":[["CX-57",1,"Nos"]],
+  "CH906":[["FOM-CH906",1,"Nos"]],
+  "CH910":[["CX2-M-WH",1,"Nos"],["CX-57",1,"Nos"]],
+  "CH911":[["PU-911",1,"Nos"]],
+  "CH912_P2":[["OS_CX912-Gel",2,"Nos"]],
+  "CH912_P3":[["OS_CX912-Gel",3,"Nos"]],
+  "CH913_P1":[["OS_CX913-Gel",1,"Nos"]],
+  "CH913_P2":[["OS_CX913-Gel",2,"Nos"]],
+  "DONUT_L_B":[["CX12",1,"Nos"]],
+  "FO100_BLUE":[["OS_CX100",1,"Pair"]],
+  "FO102_DUAL":[["CX102",1,"Nos"]],
+  "FO103":[["FOM-FO103",1,"Nos"]],
+  "FO104":[["CX104-A",1,"Nos"],["CX104-B",1,"Nos"]],
+  "FO105_3PCS_DUAL":[["FOM-FO105-3P",1,"Nos"]],
+  "FO105_4PCS_DUAL":[["FOM-FO105-4P",1,"Nos"]],
+  "FO106":[["CX106",1,"Nos"]],
+  "FO107":[["FOM-FO107",1,"Nos"]],
+  "FO108_CPAP":[["CX108",1,"Nos"]],
+  "FO10_10IN_DG":[["FOM-FO10-L",1,"Nos"]],
+  "FO10_6IN_DG":[["FOM-FO10-S",1,"Nos"]],
+  "FO10_ADJ_DG":[["FOM-FO10-ADJ",1,"Nos"]],
+  "FO10_S_DG":[["FOM-FO10-M",1,"Nos"]],
+  "FO18B":[["CX18-S",1,"Nos"]],
+  "FO18B_LARGE_P1":[["CX18-L",1,"Nos"]],
+  "FO18B_LARGE_P2":[["CX18-L",2,"Nos"]],
+  "FO18B_MEDIUM_P1":[["CX18-M",1,"Nos"]],
+  "FO18B_MEDIUM_P2":[["CX18-M",2,"Nos"]],
+  "FO18B_P2":[["CX18-S",2,"Nos"]],
+  "FO18G":[["CX18-S",1,"Nos"]],
+  "FO18G_LARGE_P1":[["CX18-L",1,"Nos"]],
+  "FO18G_LARGE_P2":[["CX18-L",2,"Nos"]],
+  "FO18G_MEDIUM_P1":[["CX18-M",1,"Nos"]],
+  "FO18G_MEDIUM_P2":[["CX18-M",2,"Nos"]],
+  "FO18G_P2":[["CX18-S",2,"Nos"]],
+  "FO19_MF":[["CX19",1,"Nos"]],
+  "FO22_DG":[["FOM-FO22",1,"Nos"]],
+  "FO24G":[["FOM-FO24",1,"Nos"]],
+  "FO24_ADJ_G":[["FOM-FO24-ADJ",1,"Nos"]],
+  "FO27BR":[["FOM-FO27",1,"Nos"]],
+  "FO27BR_XL":[["FOM-FO27-XL",1,"Nos"]],
+  "FO27G":[["FOM-FO27",1,"Nos"]],
+  "FO27G_XL":[["FOM-FO27-XL",1,"Nos"]],
+  "FO27_DG":[["FOM-FO27",1,"Nos"]],
+  "FO27_NB":[["FOM-FO27",1,"Nos"]],
+  "FO27_XL_DG":[["FOM-FO27-XL",1,"Nos"]],
+  "FO27_XL_NB":[["FOM-FO27-XL",1,"Nos"]],
+  "FO28_4MB":[["FOM-FO28-HR",1,"Nos"],["FOM-FO28-BASE",1,"Nos"]],
+  "FO2PLUS_MB":[["CX2-Plus",1,"Nos"]],
+  "FO2_FO57":[["CX2-L",1,"Nos"],["CX-57",1,"Nos"]],
+  "FO2_VB_L":[["CX2-L",1,"Nos"]],
+  "FO32_DG":[["FOM-FO32",1,"Nos"]],
+  "FO33BR":[["FOM-FO33-C",1,"Nos"],["FOM-FO33-B",1,"Nos"],["FOM-FO33-A",1,"Nos"]],
+  "FO33CM":[["FOM-FO33-C",1,"Nos"],["FOM-FO33-B",1,"Nos"],["FOM-FO33-A",1,"Nos"]],
+  "FO33DG":[["FOM-FO33-C",1,"Nos"],["FOM-FO33-B",1,"Nos"],["FOM-FO33-A",1,"Nos"]],
+  "FO33GR":[["FOM-FO33-C",1,"Nos"],["FOM-FO33-B",1,"Nos"],["FOM-FO33-A",1,"Nos"]],
+  "FO34DG":[["FOM-FO34-1",1,"Nos"],["FOM-FO34-2",1,"Nos"]],
+  "FO34_FLAT":[["FOM-FO34F-1",1,"Nos"],["FOM-FO34F-2",1,"Nos"]],
+  "FO37_BR":[["FOM-FO37-C",1,"Nos"],["FOM-FO27",1,"Nos"]],
+  "FO37_DG":[["FOM-FO37-C",1,"Nos"],["FOM-FO27",1,"Nos"]],
+  "FO37_NB":[["FOM-FO37-C",1,"Nos"],["FOM-FO27",1,"Nos"]],
+  "FO37_VG":[["FOM-FO37-C",1,"Nos"],["FOM-FO27",1,"Nos"]],
+  "FO38_BM":[["FOM-FO38",1,"Nos"]],
+  "FO38_BR":[["FOM-FO38",1,"Nos"]],
+  "FO38_DG":[["FOM-FO38",1,"Nos"]],
+  "FO38_NB":[["FOM-FO38",1,"Nos"]],
+  "FO38_VG":[["FOM-FO38",1,"Nos"]],
+  "FO3_MS_BK":[["CX3",1,"Nos"]],
+  "FO3_MS_GR":[["CX3",1,"Nos"]],
+  "FO44":[["CX44-PUGEL",1,"Nos"]],
+  "FO44_HR":[["FOM-FO44-HR",2,"Nos"]],
+  "FO45":[["CX45",1,"Nos"]],
+  "FO45_FO3":[["CX3",1,"Nos"],["CX45",1,"Nos"]],
+  "FO48":[["FOM-FO48",1,"Nos"]],
+  "FO4_DG":[["CX4",1,"Nos"]],
+  "FO4_NB":[["CX4",1,"Nos"]],
+  "FO4_VG":[["CX4",1,"Nos"]],
+  "FO57_MB":[["CX-57",1,"Nos"]],
+  "FO5_DG":[["CX5",1,"Nos"]],
+  "FO60_DG":[["CX-60",1,"Nos"]],
+  "FO60_GR":[["CX-60",1,"Nos"]],
+  "FO60_NB":[["CX-60",1,"Nos"]],
+  "FO64_STD_G":[["CX-64",1,"Nos"]],
+  "FO6_L_BK":[["FOM-FO6",1,"Nos"]],
+  "FO73":[["CX2-L",1,"Nos"],["CX-57",1,"Nos"]],
+  "FO74_K_GR_L":[["FOM-FO74-K",1,"Nos"]],
+  "FO74_Q_GR_L":[["FOM-FO74-Q",1,"Nos"]],
+  "FO75_28_GR":[["FOM-FO75-S",1,"Nos"]],
+  "FO75_36_GR":[["FOM-FO75-L",1,"Nos"]],
+  "FO77_L":[["OS_CX77-L-Gel",1,"Nos"]],
+  "FO77_R":[["OS_CX77-R-Gel",1,"Nos"]],
+  "FO78_S":[["FOM-FO78-S",1,"Nos"]],
+  "FO7_KING_G_NEW":[["CX7-K",1,"Nos"]],
+  "FO7_KING_WHITE":[["CX7-K",1,"Nos"]],
+  "FO7_QUEEN_WHITE":[["CX7-Q",1,"Nos"]],
+  "FO7_QUE_G_NEW":[["CX7-Q",1,"Nos"]],
+  "FO7_STD_WHITE":[["CX-64",1,"Nos"]],
+  "FO80_F_P1":[["OS_CX80-F",1,"Pair"]],
+  "FO80_M_P1":[["OS_CX80-M",1,"Pair"]],
+  "FO82":[["FOM-FO82",1,"Nos"]],
+  "FO82_BLACK":[["FOM-FO82",1,"Nos"]],
+  "FO83":[["FOM-FO83",1,"Nos"]],
+  "FO83_NB":[["FOM-FO83",1,"Nos"]],
+  "FO84_VELVET_DG":[["CX-84",1,"Nos"]],
+  "FO85_BL":[["FOM-FO85-L",1,"Nos"]],
+  "FO85_DG":[["FOM-FO85-L",1,"Nos"]],
+  "FO85_M_BL":[["FOM-FO85-M",1,"Nos"]],
+  "FO85_M_DG":[["FOM-FO85-M",1,"Nos"]],
+  "FO86_BL":[["FOM-FO86",1,"Nos"]],
+  "FO86_DG":[["FOM-FO86",1,"Nos"]],
+  "FO87":[["CX-87",1,"Nos"]],
+  "FO8_DG":[["CX8",1,"Nos"]],
+  "FO8_NB":[["CX8",1,"Nos"]],
+  "FO8_VG":[["CX8",1,"Nos"]],
+  "FO92":[["FOM-FO92",1,"Nos"]],
+  "FO93":[["CX45",1,"Nos"],["CX18-M",1,"Nos"],["CX3-Plus",1,"Nos"]],
+  "FO94":[["CX94-PUGEL",1,"Nos"]],
+  "FO98_GREY":[["CX98",1,"Nos"]],
+  "FO98_WHITE":[["CX98",1,"Nos"]],
+  "FO99_F":[["OS_CX99-F",1,"Pair"]],
+  "FO99_M":[["OS_CX99-M",1,"Pair"]],
+  "FO9_7_BM":[["FOM-FO9-M",1,"Nos"]],
+  "FO9_7_BM_MINI":[["FOM-FO9-S",1,"Nos"]],
+  "FO9_7_BR":[["FOM-FO9-M",1,"Nos"]],
+  "FO9_7_BR_MINI":[["FOM-FO9-S",1,"Nos"]],
+  "FO9_7_GR":[["FOM-FO9-M",1,"Nos"]],
+  "FO9_7_GR_MINI":[["FOM-FO9-S",1,"Nos"]],
+  "FO9_M_DG":[["FOM-FO9-M",1,"Nos"]],
+  "FO9_M_NB":[["FOM-FO9-M",1,"Nos"]],
+  "FO9_S_DG":[["FOM-FO9-S",1,"Nos"]],
+  "FO9_S_NB":[["FOM-FO9-S",1,"Nos"]],
+  "FOOT_ELE":[["FOM-FO13",1,"Nos"]],
+  "FO_CO_L_B":[["CX2-L",1,"Nos"]],
+  "FO_HI_L_P1":[["OS_CX-HI-Red-L",1,"Pair"]],
+  "FO_HI_P1":[["OS_CX-HI-Red",1,"Pair"]],
+  "FO_LS_B":[["CX1",1,"Nos"]],
+  "FO_MF_21":[["CX21",1,"Nos"]],
+  "GR14_B":[["FOM-GR14",1,"Nos"]],
+  "GR15_R_CL_P1":[["OS_CX-GR15-R",1,"Pair"]],
+  "GR15_S_CL_P1":[["OS_CX-GR15-S",1,"Pair"]],
+  "HM18_BK_M_P1":[["CX18-M",1,"Nos"]],
+  "HM18_BK_M_P2":[["CX18-M",2,"Nos"]],
+  "HM3_BK":[["CX3-Plus",1,"Nos"]],
+  "HM45_BK":[["CX45",1,"Nos"]],
+  "HM93_BK":[["CX3-Plus",1,"Nos"],["CX45",1,"Nos"],["CX18-M",1,"Nos"]],
+  "INSOLES_FE":[["OS_CX15-F",1,"Pair"]],
+  "INSOLE_ML":[["OS_CX15-M",1,"Pair"]]
+};
+
 const SLOTS = [
   { id: 'confirmed',   label: 'Confirmed PO Dump',   hint: 'Vendor Central PO export, Status = Confirmed' },
   { id: 'unconfirmed', label: 'Unconfirmed PO Dump', hint: 'Vendor Central PO export, Status = Unconfirmed' },
   { id: 'inventory',   label: 'Inventory',           hint: 'Vendor Central inventory report' }
 ];
 const S = {
-  cfg: { targetDays: 51, requestDays: 30, minQty: 3, fullQty: 20, overstockDays: 51, overPct: 5, buildQty: 200, benchmarkDoc: 51, minPoReq: 0 },
+  cfg: { targetDays: 51, requestDays: 30, minQty: 3, fullQty: 20, overstockDays: 51, overPct: 5, buildQty: 200, benchmarkDoc: 51, minPoReq: 0,
+         docHigh: 10, docMed: 20, riskDays: 30 },
   theme: 'light',
   shared: { drr: { lines: [], hasVendor: false }, meta: null, split: null },
   fcFilter: '', poFilter: '', statusFilter: { disc: false, over: false, prog: false },
@@ -1051,8 +1356,8 @@ function hasData() {
 const COLS = {
   plan: [
     { k:'vendor_', t:'Vendor', cls:'txt', all:true },
-    { k:'asin', t:'ASIN', cls:'txt mono' },
-    { k:'sku', t:'SKU', cls:'txt mono dim' },
+    { k:'sku', t:'SKU', cls:'txt mono skucell' },
+    { k:'asin', t:'ASIN', cls:'txt mono dim' },
     { k:'drr', t:'DRR (potential)', f:v=>dec(v,2) },
     { k:'drrActual', t:'DRR (actual)', f:v=>dec(v,2), cls:'nm dim' },
     { k:'drrStatus', t:'DRR Status', cls:'txt dim' },
@@ -1082,7 +1387,8 @@ const COLS = {
   ],
   line: [
     { k:'vendor_', t:'Vendor', cls:'txt', all:true },
-    { k:'asin', t:'ASIN', cls:'txt mono' },
+    { k:'sku', t:'SKU', cls:'txt mono skucell' },
+    { k:'asin', t:'ASIN', cls:'txt mono dim' },
     { k:'po', t:'PO', cls:'txt mono' },
     { k:'vendor', t:'Vendor Code', cls:'txt mono dim' },
     { k:'channel', t:'Channel', cls:'txt', tone:'chan' },
@@ -1115,6 +1421,49 @@ const COLS = {
     { k:'now', t:'Amazon Now', f:money, tone:'now' },
     { k:'qty', t:'TOTAL QTY', f:money, tone:'key' },
     { k:'balance', t:'Not Taken', f:money, cls:'dim' }
+  ],
+  /* memory foam — rollup by raw-material code */
+  foam: [
+    { k:'rm', t:'FOAM CODE', cls:'txt mono skucell', tone:'key' },
+    { k:'unit', t:'UoM', cls:'txt dim' },
+    { k:'foamQty', t:'FOAM UNITS NEEDED', f:money, tone:'key' },
+    { k:'skus', t:'SKUs', f:money },
+    { k:'units', t:'Finished Units', f:money },
+    { k:'skuList', t:'SKU Codes', cls:'txt mono dim wide' }
+  ],
+  /* memory foam — one row per SKU x component */
+  foamSku: [
+    { k:'vendor_', t:'Vendor', cls:'txt', all:true },
+    { k:'sku', t:'SKU', cls:'txt mono skucell', tone:'key' },
+    { k:'asin', t:'ASIN', cls:'txt mono dim' },
+    { k:'procTot', t:'ACCEPTED QTY', f:money, tone:'key' },
+    { k:'rm', t:'Foam Code', cls:'txt mono' },
+    { k:'perUnit', t:'Per Unit', f:money },
+    { k:'unit', t:'UoM', cls:'txt dim' },
+    { k:'foamQty', t:'FOAM UNITS', f:money, tone:'key2' },
+    { k:'procReg', t:'Accept Reg', f:money, cls:'nm dim' },
+    { k:'procNow', t:'Accept Now', f:money, tone:'now' },
+    { k:'name', t:'Product', cls:'txt dim wide' }
+  ],
+  /* dispatch priority */
+  priority: [
+    { k:'vendor_', t:'Vendor', cls:'txt', all:true },
+    { k:'rank', t:'#', f:money, cls:'nm dim' },
+    { k:'band', t:'PRIORITY', cls:'txt', tone:'band' },
+    { k:'sku', t:'SKU', cls:'txt mono skucell', tone:'key' },
+    { k:'asin', t:'ASIN', cls:'txt mono dim' },
+    { k:'procTot', t:'DISPATCH QTY', f:money, tone:'key' },
+    { k:'docSoh', t:'DOC (days)', f:v=>dec(v,1), tone:'key2' },
+    { k:'drr', t:'DRR', f:v=>dec(v,2) },
+    { k:'inventory', t:'FC Stock', f:money },
+    { k:'openTot', t:'Open PO', f:money, cls:'nm dim' },
+    { k:'shortDays', t:'Days Short', f:v=>dec(v,1), cls:'nm dim' },
+    { k:'riskUnits', t:'Units at Risk', f:v=>money(Math.round(v)) },
+    { k:'riskValue', t:'VALUE AT RISK', f:inrFull, tone:'key2' },
+    { k:'score', t:'Score', f:v=>dec(v,1) },
+    { k:'procNow', t:'Of which Now', f:money, tone:'now' },
+    { k:'acceptValue', t:'Accepted Value', f:inrFull, cls:'nm dim' },
+    { k:'why', t:'Why', cls:'txt dim wide' }
   ]
 };
 
@@ -1230,6 +1579,9 @@ function renderSettings() {
       <label>Progressing build-up qty<input type="number" id="bq" value="${S.cfg.buildQty}" min="0" max="99999"></label>
       <label>Skip PO lines up to<input type="number" id="mq" value="${S.cfg.minQty}" min="0" max="9999"></label>
       <label>Accept in full up to<input type="number" id="fq" value="${S.cfg.fullQty}" min="0" max="99999"></label>
+      <label>Dispatch High ≤ DOC<input type="number" id="dh" value="${S.cfg.docHigh}" min="0" max="999" title="Days of cover at or below this are High priority to dispatch."></label>
+      <label>Dispatch Medium ≤ DOC<input type="number" id="dm" value="${S.cfg.docMed}" min="0" max="999" title="Days of cover at or below this (and above the High cut) are Medium. Everything above is Low."></label>
+      <label>Stockout risk horizon (days)<input type="number" id="rk" value="${S.cfg.riskDays}" min="1" max="365" title="Value at risk is the demand we could not serve within this many days, priced at the PO unit cost."></label>
 
       ${list.map(vid => `<label>${esc(S.vendors[vid].label)} · Amazon Now code
         <input type="text" class="nowin" data-v="${vid}" value="${esc(S.vendors[vid].nowCode)}" placeholder="none"></label>`).join('')}
@@ -1242,6 +1594,17 @@ function renderSettings() {
   $('#mp').onchange = e => { S.cfg.minPoReq     = Math.max(0, +e.target.value || 0);  render(); saveSession(); };
   $('#mq').onchange = e => { S.cfg.minQty = Math.max(0, +e.target.value || 0); recompute(); render(); saveSession(); };
   $('#fq').onchange = e => { S.cfg.fullQty = Math.max(0, +e.target.value || 0); recompute(); render(); saveSession(); };
+  // dispatch banding is a presentation cut over the existing plan — no recompute needed
+  $('#dh').onchange = e => {
+    S.cfg.docHigh = Math.max(0, +e.target.value || 0);
+    if (S.cfg.docMed < S.cfg.docHigh) S.cfg.docMed = S.cfg.docHigh;   // keep the bands ordered
+    render(); saveSession();
+  };
+  $('#dm').onchange = e => {
+    S.cfg.docMed = Math.max(S.cfg.docHigh, +e.target.value || 0);
+    render(); saveSession();
+  };
+  $('#rk').onchange = e => { S.cfg.riskDays = Math.max(1, +e.target.value || 30); render(); saveSession(); };
   $$('.nowin').forEach(i => i.onchange = e => {
     S.vendors[i.dataset.v].nowCode = e.target.value.trim().toUpperCase();
     recompute(); render(); saveSession();
@@ -1249,9 +1612,11 @@ function renderSettings() {
 }
 
 const VIEWS = [
-  { id:'accept', t:'PO Accept' },
-  { id:'short',  t:'Manual PO Request' },
-  { id:'plan',   t:'ASIN Plan' }
+  { id:'accept',   t:'PO Accept' },
+  { id:'priority', t:'Dispatch Priority' },
+  { id:'foam',     t:'Memory Foam' },
+  { id:'short',    t:'Manual PO Request' },
+  { id:'plan',     t:'ASIN Plan' }
 ];
 function renderViewTabs() {
   $('#views').innerHTML = VIEWS.map(v =>
@@ -1403,7 +1768,9 @@ function makeTest(expr, isNumeric) {
   return v => tests.every(t => t(v));
 }
 
-const NUM_KEYS = ['drr','docSoh','docPo','daysCover','urgency','priority','priorityRaw','rank','pct'];
+const NUM_KEYS = ['drr','docSoh','docPo','daysCover','urgency','priority','priorityRaw','rank','pct',
+                  'foamQty','perUnit','units','skus','score','riskUnits','riskValue','acceptValue',
+                  'shortDays','cost'];
 function isNumericCol(c) { return c.f === money || NUM_KEYS.includes(c.k); }
 
 function activeFilters() { return S.filters[S.view] || (S.filters[S.view] = {}); }
@@ -1427,6 +1794,33 @@ function applyFilters(rows, cols) {
 /* ---------- table ---------- */
 function currentTable() {
   const vids = S.active === 'ALL' ? VENDORS.map(v => v.id) : [S.active];
+
+  /* Memory foam: what the accepted quantities pull out of foam stock.
+     The rollup is the table you act on; the per-SKU expansion rides underneath it
+     as a summary block, the same shape the line view uses for its FC/PO summaries. */
+  if (S.view === 'foam') {
+    let plan = [];
+    vids.forEach(vid => S.vendors[vid].plan.forEach(p =>
+      plan.push({ ...p, vendor_: S.vendors[vid].label })));
+    const f = CALC.foamConsumption(plan, FOAM_BOM);
+    return { cols: COLS.foam, rows: f.rmRows, kind:'foam',
+             foam: f,
+             skuRows: f.skuRows.filter(r => !r.all || S.active === 'ALL'),
+             skuCols: COLS.foamSku.filter(c => !c.all || S.active === 'ALL') };
+  }
+
+  /* Dispatch priority: given what we accepted, what ships first. */
+  if (S.view === 'priority') {
+    let plan = [];
+    vids.forEach(vid => S.vendors[vid].plan.forEach(p =>
+      plan.push({ ...p, vendor_: S.vendors[vid].label })));
+    const rows = CALC.dispatchPriority(plan, S.cfg);
+    // dispatchPriority drops vendor_, so re-attach from the plan it was built off
+    const vmap = new Map(plan.map(p => [p.asin, p.vendor_]));
+    rows.forEach(r => { r.vendor_ = vmap.get(r.asin) || ''; });
+    return { cols: COLS.priority, rows, kind:'priority' };
+  }
+
   if (S.view === 'plan') {
     let rows = [];
     vids.forEach(vid => S.vendors[vid].plan.forEach(p => rows.push({ ...p, vendor_: S.vendors[vid].label })));
@@ -1458,7 +1852,7 @@ function currentTable() {
     });
     rows.sort((a,b) => b.priority - a.priority || b.poReq - a.poReq);
     rows = rows.map((r,i) => ({ ...r, rank: i + 1 }));
-    const want = ['vendor_','rank','asin','vendorCode','sku','status','asinStatus','drr','inventory','openTot','docPo','urgency','priority','target','poReq','remarks'];
+    const want = ['vendor_','rank','sku','vendorCode','asin','status','asinStatus','drr','inventory','openTot','docPo','urgency','priority','target','poReq','remarks'];
     const cols = want.map(k => {
       if (k === 'vendorCode') return { k:'vendorCode', t:'Vendor Code', cls:'txt mono' };
       return COLS.plan.find(c => c.k === k);
@@ -1567,8 +1961,8 @@ function renderAcceptView() {
       <td class="nm dim">${money(l.balance)}</td></tr>`).join('');
     return `<tr class="grow"><td colspan="9">
         <div class="gwrap"><div class="gleft">
-          <span class="gasin">${esc(g.asin)}</span>
           <span class="gsku">${esc(g.sku)}</span>
+          <span class="gasin">${esc(g.asin)}</span>
           ${S.active === 'ALL' ? `<span class="chip">${esc(g.vendor_)}</span>` : ''}
           <span class="gname" title="${esc(g.name)}">${esc(g.name)}</span>
         </div>
@@ -1683,7 +2077,7 @@ function renderTable() {
   const t = currentTable();
   const q = S.q.trim().toLowerCase();
   let rows = t.rows;
-  if (q) rows = rows.filter(r => ['asin','sku','po','fc','name','vendor_','remarks']
+  if (q) rows = rows.filter(r => ['asin','sku','po','fc','name','vendor_','remarks','rm','band','why','skuList']
     .some(k => String(r[k] || '').toLowerCase().includes(q)));
   if (S.sort.col) {
     const c = S.sort.col, d = S.sort.dir;
@@ -1697,7 +2091,9 @@ function renderTable() {
   const preFilter = rows.length;
   rows = applyFilters(rows, cols);
 
-  const summaryBlock = (rowsIn, colsIn, label, tag) => `<div class="fcwrap"><div class="blockhead">${label}
+  /* sumKeys limits the TOTAL row to columns that are meaningful to add up —
+     a per-unit BOM ratio must never be summed the way a quantity is. */
+  const summaryBlock = (rowsIn, colsIn, label, tag, sumKeys) => `<div class="fcwrap"><div class="blockhead">${label}
       <span class="cnt">${money(rowsIn.length)} rows</span>
       <button class="mini" data-exp="${tag}">Export CSV</button></div>
     <div class="scroll short"><table class="tbl"><thead><tr>${colsIn.map(c=>`<th class="${c.cls||'nm'} ${c.tone||''}">${c.t}</th>`).join('')}</tr></thead>
@@ -1706,18 +2102,64 @@ function renderTable() {
       const hot = c.k === 'qty' && r.qty > 0 ? ' hot' : '';
       const ch  = c.k === 'channel' && r.channel === 'Amazon Now' ? ' now' : '';
       return `<td class="${c.cls||'nm'} ${c.tone||''}${hot}${ch}">${v}</td>`;}).join('')}</tr>`).join('')}
-    <tr class="totrow">${colsIn.map((c,i)=>{
+    ${sumKeys && !sumKeys.length ? '' : `<tr class="totrow">${colsIn.map((c,i)=>{
       if (i===0) return '<td class="txt">TOTAL</td>';
       if (!c.f || c.k==='pct') return '<td></td>';
+      if (sumKeys && !sumKeys.includes(c.k)) return '<td></td>';
       return `<td class="nm ${c.tone||''}">${money(rowsIn.reduce((s,r)=>s+(+r[c.k]||0),0))}</td>`;
-    }).join('')}</tr></tbody></table></div></div>`;
+    }).join('')}</tr>`}</tbody></table></div></div>`;
 
   let fcBlock = '';
   if (t.poRows) fcBlock += summaryBlock(t.poRows, t.poCols, 'Qty to accept, by purchase order', 'po');
   if (t.fcRows) fcBlock += summaryBlock(t.fcRows, t.fcCols, 'Qty to accept, by fulfilment centre', 'fc');
 
-  const totals = cols.map(c => (c.f === money && ['procTot','poReq','allocated','lineQty','balance','procReg','procNow','uncReg','uncNow','openTot','openReg','openNow','inventory'].includes(c.k))
+  /* Memory foam: the SKU x component expansion sits under the foam-code rollup,
+     plus the two exception lists so nothing is silently dropped. */
+  let foamBlock = '';
+  if (t.kind === 'foam') {
+    const fx = t.foam;
+    // No total row here: a SKU with three foams repeats its accepted qty on three
+    // rows, and foam units span two units of measure. The rollup above is the
+    // authoritative total; this block is the drill-down behind it.
+    foamBlock = summaryBlock(t.skuRows, t.skuCols,
+      'Foam draw, by SKU and component', 'foamsku', []);
+    if (fx.notFoam.length) {
+      const cols2 = [
+        { k:'sku', t:'SKU', cls:'txt mono skucell' },
+        { k:'asin', t:'ASIN', cls:'txt mono dim' },
+        { k:'procTot', t:'Accepted Qty', f:money },
+        { k:'name', t:'Product', cls:'txt dim wide' }
+      ];
+      foamBlock += summaryBlock(fx.notFoam, cols2,
+        'Accepted SKUs with no foam in their BOM — nothing to draw', 'foamnone', ['procTot']);
+    }
+    if (fx.idle.length) {
+      foamBlock += `<div class="fcwrap"><div class="blockhead">Foam SKUs with no accepted quantity this cycle
+        <span class="cnt">${money(fx.idle.length)} of ${money(Object.keys(FOAM_BOM).length)} BOM SKUs</span></div>
+        <div class="note idlelist">${fx.idle.map(s=>`<span class="chip">${esc(s)}</span>`).join(' ')}</div></div>`;
+    }
+  }
+
+  const SUMMABLE = ['procTot','poReq','allocated','lineQty','balance','procReg','procNow',
+                    'uncReg','uncNow','openTot','openReg','openNow','inventory',
+                    'foamQty','riskUnits','riskValue','acceptValue'];
+  /* On the foam rollup, `skus` and `units` count the same finished unit once per
+     component, so a SKU drawing three foams would be counted three times. Only the
+     foam quantity is genuinely additive — and then only within one unit of measure. */
+  const noTotal = t.kind === 'foam' ? ['skus','units'] : [];
+  const totals = cols.map(c => (c.f && SUMMABLE.includes(c.k) && !noTotal.includes(c.k))
     ? rows.reduce((s, r) => s + (+r[c.k] || 0), 0) : null);
+
+  /* "Nos" and "Pair" are different physical things. Rather than print one wrong
+     number, the foam total breaks itself out by unit of measure. */
+  const foamUnitTotals = t.kind === 'foam'
+    ? (() => {
+        const m = new Map();
+        rows.forEach(r => m.set(r.unit, (m.get(r.unit) || 0) + (+r.foamQty || 0)));
+        return [...m.entries()].sort((a, b) => b[1] - a[1])
+          .map(([u, v]) => `${money(v)} ${esc(u)}`).join(' · ');
+      })()
+    : null;
 
   const f = activeFilters();
   const head = `<tr>${cols.map(c =>
@@ -1740,22 +2182,40 @@ function renderTable() {
     if (c.k === 'status' && r.status === 'Overstock') extra = ' overcell';
     if (c.k === 'status' && r.status === 'Progressing') extra = ' progcell';
     if (c.k === 'asinStatus' && /sales/i.test(r.asinStatus || '')) extra = ' deadcell';
+    if (c.k === 'band') extra = ' band' + r.band;
+    if (c.k === 'docSoh' && r.band === 'High') extra = ' hot2';
+    if (c.k === 'foamQty' && r.foamQty > 0) extra = ' hot2';
     return `<td class="${c.cls||'nm'} ${c.tone||''}${extra}">${v}</td>`;
   }).join('')}</tr>`).join('');
+  // money columns must total in rupees, not as a bare count
+  const CURRENCY = ['riskValue','acceptValue','poReqValue'];
   const foot = totals.some(x => x !== null)
-    ? `<tr class="totrow">${cols.map((c,i) => i===0 ? '<td class="txt">TOTAL</td>'
-        : (totals[i] === null ? '<td></td>' : `<td class="nm ${c.tone||''}">${money(totals[i])}</td>`)).join('')}</tr>` : '';
+    ? `<tr class="totrow">${cols.map((c,i) => {
+        if (i === 0) return '<td class="txt">TOTAL</td>';
+        if (c.k === 'foamQty' && foamUnitTotals !== null)
+          return `<td class="nm ${c.tone||''} uomtot">${foamUnitTotals}</td>`;
+        if (totals[i] === null) return '<td></td>';
+        return `<td class="nm ${c.tone||''}">${CURRENCY.includes(c.k) ? inrFull(totals[i]) : money(Math.round(totals[i]))}</td>`;
+      }).join('')}</tr>` : '';
+
+  const bandCount = t.kind === 'priority'
+    ? ['High','Medium','Low'].map(b => `${b} ${money(rows.filter(r=>r.band===b).length)}`).join(' · ') : '';
 
   $('#tablewrap').innerHTML = fcBlock + `<div class="blockhead">${
       { plan:'ASIN plan', short:'ASINs short of cover — quantity to request from Amazon',
-        accept:'Line-level acceptance against unconfirmed POs' }[t.kind === 'line' ? S.view : t.kind]
+        accept:'Line-level acceptance against unconfirmed POs',
+        foam:'Memory foam required against accepted PO quantities, by foam code',
+        priority:'Dispatch priority — what to ship first from the accepted quantities'
+      }[t.kind === 'line' ? S.view : t.kind]
     }<span class="cnt">${money(rows.length)} rows${preFilter !== rows.length ? ` of ${money(preFilter)}` : ''}</span>
+    ${bandCount ? `<span class="acctot">${bandCount}</span>` : ''}
     ${S.view === 'accept' ? `<button class="mini src">Export accepted PO sheet</button>` : ''}
     ${S.view === 'short'  ? `<button class="mini" data-exp="poreq">Download PO Request</button>` : ''}
     ${filterCount() ? `<button class="mini clr">Clear ${filterCount()} filter${filterCount()>1?'s':''}</button>` : ''}
     <button class="mini" data-exp="main">Export CSV</button></div>
     <div class="scroll"><table class="tbl"><thead>${head}</thead><tbody>${body}${foot}</tbody></table></div>
-    ${rows.length > 3000 ? '<div class="note">Showing first 3,000 rows — export the CSV for the full list.</div>' : ''}`;
+    ${rows.length > 3000 ? '<div class="note">Showing first 3,000 rows — export the CSV for the full list.</div>' : ''}`
+    + foamBlock;
 
   $$('#tablewrap th[data-sort]').forEach(th => th.onclick = () => {
     const k = th.dataset.sort;
@@ -1773,6 +2233,10 @@ function renderTable() {
     if (b.dataset.exp === 'fc') exportCSV(t.fcCols, t.fcRows, 'accept-by-fc');
     else if (b.dataset.exp === 'po') exportCSV(t.poCols, t.poRows, 'accept-by-po');
     else if (b.dataset.exp === 'poreq') exportPORequest(rows);
+    else if (b.dataset.exp === 'foamsku')  exportCSV(t.skuCols, t.skuRows, 'memory-foam-by-sku');
+    else if (b.dataset.exp === 'foamnone') exportCSV(
+      [{k:'sku',t:'SKU'},{k:'asin',t:'ASIN'},{k:'procTot',t:'Accepted Qty'},{k:'name',t:'Product'}],
+      t.foam.notFoam, 'accepted-no-foam');
     else exportCSV(cols, rows, S.view);
   });
   $$('#tablewrap .fin').forEach(inp => {
