@@ -203,6 +203,8 @@ td.bandLow{color:var(--dim)}
 .dlbtn,.drop .mini.dl{margin-top:6px;font-size:11px;padding:3px 9px;border-radius:6px;
   border:1px solid var(--line);background:transparent;color:var(--dim);cursor:pointer}
 .dlbtn:hover,.drop .mini.dl:hover{color:var(--brand);border-color:var(--brand)}
+/* a rebuilt CSV is not the original file, so it reads as the lesser option */
+.dlbtn.rebuilt,.drop .mini.dl.rebuilt{opacity:.75;border-style:dashed}
 /* the confirmed-PO drop card on the Dispatch Priority tab */
 .dropcard .ugrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;padding:10px}
 .bignote{padding:18px 16px;line-height:1.6;color:var(--dim);font-size:13px}
@@ -1353,6 +1355,44 @@ function downloadStoredFile(meta) {
   return true;
 }
 
+/* An upload made before the app started keeping the original bytes — or one too
+   large to keep — still has its parsed rows, so the data can be handed back as a
+   CSV even though the original file is gone. Not byte-identical, and the caller
+   says so, but it beats a button that does nothing. */
+function rebuildUploadCSV(vendorId, slot) {
+  const rows = vendorId === '_shared'
+    ? ((S.shared.drr && S.shared.drr.lines) || [])
+    : ((S.vendors[vendorId] && S.vendors[vendorId].raw[slot]) || []);
+  if (!rows.length) return false;
+  const keys = [...rows.reduce((set, r) => {
+    Object.keys(r).forEach(k => { if (typeof r[k] !== 'object') set.add(k); });
+    return set;
+  }, new Set())];
+  const label = vendorId === '_shared' ? 'drr' : `${vendorId}-${slot}`;
+  downloadCSV(keys, rows.map(r => keys.map(k => r[k])), `rebuilt-${label}`);
+  return true;
+}
+
+/* One entry point for both: exact file when we have it, rebuilt rows when we don't. */
+function downloadUpload(vendorId, slot) {
+  const meta = vendorId === '_shared' ? S.shared.meta : (S.vendors[vendorId] || {}).meta[slot];
+  if (downloadStoredFile(meta)) return;
+  if (rebuildUploadCSV(vendorId, slot)) return;
+  alert('Nothing to download for this slot yet — import a sheet first.');
+}
+
+/* Button markup shared by every drop zone. The button is always present on a good
+   upload: hiding it for older uploads made the feature look broken. */
+function dlButtonFor(meta, vendorId, slot, cls) {
+  if (!meta || meta.error) return '';
+  const exact = !!(meta.file && meta.file.buf);
+  return `<button class="${cls}${exact ? '' : ' rebuilt'}" data-v="${vendorId}" data-s="${slot}"
+    title="${exact
+      ? 'Download this file exactly as it was uploaded'
+      : 'The original file is not held for this upload (imported before the app kept originals, or over 12 MB). Downloads the parsed rows as CSV instead — re-import to get the exact file back.'}"
+    >Download${exact ? '' : ' (CSV)'}</button>`;
+}
+
 async function handleFiles(vendorId, slot, files) {
   if (!files || !files.length) return;
   const shared = vendorId === '_shared';
@@ -1608,8 +1648,7 @@ function sharedCard() {
       <input type="file" accept=".xlsx,.xls,.csv,.tsv" data-v="_shared" data-s="drr" hidden>
       <div class="dtitle">DRR — all vendors</div>${detail}
       <button class="imp" data-v="_shared" data-s="drr">${m && !m.error ? 'Replace' : 'Import'}</button>
-      ${m && !m.error && m.file ? `<button class="dlbtn" data-v="_shared" data-s="drr"
-          title="Download the file exactly as it was uploaded">Download</button>` : ''}
+      ${dlButtonFor(m, '_shared', 'drr', 'dlbtn')}
     </div></div></div>`;
 }
 
@@ -1650,8 +1689,7 @@ function renderUploads() {
                  ${m.note ? `<div class="dnote">${esc(m.note)}</div>` : ''}`)
             : `<div class="dmsg">${esc(s.hint)}</div>`}
           <button class="imp" data-v="${vid}" data-s="${s.id}">${m && !m.error ? 'Replace' : 'Import'}</button>
-          ${m && !m.error && m.file ? `<button class="dlbtn" data-v="${vid}" data-s="${s.id}"
-              title="Download the file exactly as it was uploaded">Download</button>` : ''}
+          ${dlButtonFor(m, vid, s.id, 'dlbtn')}
         </div>`;
       }).join('')}</div></div>`;
   }).join('');
@@ -1667,9 +1705,7 @@ function renderUploads() {
   // hand back the original upload, byte for byte
   $$('#uploads .dlbtn').forEach(b => b.onclick = e => {
     e.preventDefault(); e.stopPropagation();
-    const meta = b.dataset.v === '_shared' ? S.shared.meta : S.vendors[b.dataset.v].meta[b.dataset.s];
-    if (!downloadStoredFile(meta))
-      alert('The original file is not held for this upload — re-import it to enable the download.');
+    downloadUpload(b.dataset.v, b.dataset.s);
   });
   $$('#uploads .drop').forEach(d => {
     d.ondragover = e => { e.preventDefault(); d.classList.add('over'); };
@@ -2257,7 +2293,7 @@ function renderTable() {
                   return f ? `<span class="freshtag ${f.cls}">${f.text}</span>` : ''; })()}`)
             : '<div class="dmsg">Drop the confirmed PO export here</div>'}
           <button class="imp" data-v="${vid}" data-s="confirmed">${m && !m.error ? 'Replace' : 'Import'}</button>
-          ${m && !m.error && m.file ? `<button class="mini dl" data-v="${vid}" data-s="confirmed">Download</button>` : ''}
+          ${dlButtonFor(m, vid, 'confirmed', 'mini dl')}
         </div>`;
       }).join('')}</div></div>`;
 
@@ -2416,12 +2452,7 @@ function renderTable() {
               .querySelector('input[type=file]').click();
       return;
     }
-    if (b.classList.contains('dl')) {
-      const V = S.vendors[b.dataset.v];
-      if (!downloadStoredFile(V && V.meta[b.dataset.s]))
-        alert('The original file is not held for this upload — re-import it to enable the download.');
-      return;
-    }
+    if (b.classList.contains('dl')) { downloadUpload(b.dataset.v, b.dataset.s); return; }
     if (b.classList.contains('src')) {
       const ids = S.active === 'ALL' ? VENDORS.map(v => v.id) : [S.active];
       const done = ids.filter(id => exportAcceptedSheet(id));
