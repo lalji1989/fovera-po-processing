@@ -208,6 +208,11 @@ td.bandLow{color:var(--dim)}
 /* the confirmed-PO drop card on the Dispatch Priority tab */
 .dropcard .ugrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;padding:10px}
 .bignote{padding:18px 16px;line-height:1.6;color:var(--dim);font-size:13px}
+.bomsrc{padding:12px 14px;border:1px dashed var(--line);border-radius:8px;align-self:start}
+.bomsrc.custom{border-style:solid;border-color:var(--brand)}
+.bomsrc-t{font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px}
+.bomsrc.custom .bomsrc-t{color:var(--brand)}
+.bomsrc-s{font-size:11.5px;color:var(--dim);line-height:1.5}
 .gname{font-size:11.5px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:380px}
 .gright{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .chip{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:2px 9px;
@@ -945,6 +950,51 @@ function foamConsumption(plan, bom) {
   return { rmRows, skuRows: bySku, notFoam, idle };
 }
 
+/* ==================== memory foam BOM sheet ====================
+   Parses an uploaded BOM master so the foam list can be maintained in Excel rather
+   than changed in code. Same shape as the sheet the module was built from:
+
+       SKU Code | Memory Foam RM Code | Qty | Units
+
+   Several rows may share a SKU — that is how a product drawing on more than one
+   foam is expressed — so rows accumulate into a list per SKU rather than replacing.
+   Qty defaults to 1 and Units to "Nos", which is what a blank in those columns has
+   always meant on this sheet. Excel leaves zero-width and direction marks in cells
+   that were pasted; those are stripped, without which whole SKUs miss the join. */
+const FOAM_COLS = ['SKU Code', 'Memory Foam RM Code', 'Qty', 'Units'];
+
+function parseFoamBom(rows) {
+  const header = (rows[0] || []).map(h => String(h == null ? '' : h));
+  const cSku  = col(header, 'SKU Code', 'SKU', 'SKU_ID', 'Item Code');
+  const cRm   = col(header, 'Memory Foam RM Code', 'RM Code', 'Foam Code', 'Foam', 'RM');
+  const cQty  = col(header, 'Qty', 'Quantity', 'Qty Per Unit', 'Per Unit');
+  const cUnit = col(header, 'Units', 'Unit', 'UoM');
+  if (!cSku || !cRm)
+    throw new Error('Need a SKU column and a foam RM code column. Found: ' + header.filter(Boolean).join(', '));
+
+  const idx = n => header.indexOf(n);
+  const iS = idx(cSku), iR = idx(cRm), iQ = cQty ? idx(cQty) : -1, iU = cUnit ? idx(cUnit) : -1;
+
+  const bom = {}; let lines = 0, skipped = 0;
+  const units = new Set(), codes = new Set();
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const sku = foamKey(row[iS]);
+    const rm  = String(row[iR] == null ? '' : row[iR]).replace(FOAM_INVIS, '').trim();
+    if (!sku || !rm) { if (String(row[iS] || row[iR] || '').trim()) skipped++; continue; }
+    const qty  = iQ >= 0 ? (num(row[iQ]) || 1) : 1;
+    const unit = (iU >= 0 ? String(row[iU] == null ? '' : row[iU]).replace(FOAM_INVIS, '').trim() : '') || 'Nos';
+    (bom[sku] = bom[sku] || []).push([rm, qty, unit]);
+    lines++; units.add(unit); codes.add(rm);
+  }
+  if (!lines) throw new Error('No usable BOM rows found under those headers.');
+
+  const skus = Object.keys(bom);
+  return { bom, lines, skus: skus.length, codes: codes.size, skipped,
+           units: [...units].sort(),
+           multi: skus.filter(k => bom[k].length > 1).length };
+}
+
 /* ==================== dispatch priority ====================
    Second step of the cycle, and it answers a different question from PO Accept.
 
@@ -1084,7 +1134,8 @@ const CALC =
     splitDRR, resolveVendor,
     pickSheet, headerScore, PO_COLS, DRR_COLS, INV_COLS,
     dispatchBudgets, acceptBudgets, parseDate, num, norm,
-    foamConsumption, dispatchPriority, dispatchBySku, foamKey };
+    foamConsumption, dispatchPriority, dispatchBySku, foamKey,
+    parseFoamBom, FOAM_COLS };
 </script>
 <script>/* ==================== state ==================== */
 const VENDORS = [
@@ -1265,6 +1316,7 @@ const S = {
          docHigh: 10, docMed: 20, riskDays: 30 },
   theme: 'light',
   shared: { drr: { lines: [], hasVendor: false }, meta: null, split: null },
+  foam: { bom: null, meta: null },   // uploaded BOM master; null = use the built-in list
   fcFilter: '', poFilter: '', statusFilter: { disc: false, over: false, prog: false },
   vendors: {}, active: 'ETRADE', view: 'accept', q: '', sort: { col: null, dir: -1 },
   filters: { accept: {}, short: {}, plan: {} },
@@ -1305,10 +1357,19 @@ const stampText = d => d ? new Date(d).toLocaleString('en-IN',
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
 
 /* ==================== file ingest ==================== */
-const SLOT_COLS = { confirmed:'PO', unconfirmed:'PO', drr:'DRR', inventory:'INV' };
+const SLOT_COLS = { confirmed:'PO', unconfirmed:'PO', drr:'DRR', inventory:'INV', bom:'BOM' };
 function wantedFor(slot) {
-  return slot === 'drr' ? CALC.DRR_COLS : slot === 'inventory' ? CALC.INV_COLS : CALC.PO_COLS;
+  return slot === 'drr'       ? CALC.DRR_COLS
+       : slot === 'inventory' ? CALC.INV_COLS
+       : slot === 'bom'       ? CALC.FOAM_COLS
+       : CALC.PO_COLS;
 }
+
+/* The BOM in use: an uploaded master when there is one, otherwise the list compiled
+   into the build. Everything that needs a BOM goes through here so the two can never
+   be read from different places. */
+function activeFoamBom() { return (S.foam && S.foam.bom) || FOAM_BOM; }
+function foamBomIsCustom() { return !!(S.foam && S.foam.bom); }
 function readSheet(file, slot) {
   return new Promise((res, rej) => {
     const fr = new FileReader();
@@ -1402,7 +1463,14 @@ async function handleFiles(vendorId, slot, files) {
   try {
     const { rows, sheet, buf } = await readSheet(files[0], slot);
     const kept = fileBlobFrom(files[0], buf);
-    if (shared) {
+    if (vendorId === '_foam') {
+      const r = CALC.parseFoamBom(rows);
+      S.foam.bom  = r.bom;
+      S.foam.meta = { name: files[0].name, sheet, count: r.lines, at: stamp(), file: kept,
+                      skus: r.skus, codes: r.codes, multi: r.multi, units: r.units,
+                      note: `${money(r.skus)} SKUs · ${money(r.codes)} foam codes · ${money(r.multi)} multi-foam`
+                            + (r.skipped ? ` · ${money(r.skipped)} incomplete row${r.skipped > 1 ? 's' : ''} skipped` : '') };
+    } else if (shared) {
       const r = CALC.parseDRR(rows);
       if (!r.lines.length) throw new Error('No ASIN rows found. Expected columns ASIN, SKU, DRR and a vendor column.');
       S.shared.drr = r;
@@ -1422,7 +1490,8 @@ async function handleFiles(vendorId, slot, files) {
     }
     recompute(); render(); saveSession();
   } catch (err) {
-    if (shared) S.shared.meta = { error: err.message, name: files[0].name };
+    if (vendorId === '_foam') S.foam.meta = { error: err.message, name: files[0].name };
+    else if (shared) S.shared.meta = { error: err.message, name: files[0].name };
     else S.vendors[vendorId].meta[slot] = { error: err.message, name: files[0].name };
     render();
   } finally { if (box) box.classList.remove('busy'); }
@@ -1953,7 +2022,7 @@ function currentTable() {
     let plan = [];
     vids.forEach(vid => S.vendors[vid].plan.forEach(p =>
       plan.push({ ...p, vendor_: S.vendors[vid].label })));
-    const f = CALC.foamConsumption(plan, FOAM_BOM);
+    const f = CALC.foamConsumption(plan, activeFoamBom());
     return { cols: COLS.foam, rows: f.rmRows, kind:'foam',
              foam: f,
              skuRows: f.skuRows.filter(r => !r.all || S.active === 'ALL'),
@@ -2310,9 +2379,37 @@ function renderTable() {
 
   /* Memory foam: the SKU x component expansion sits under the foam-code rollup,
      plus the two exception lists so nothing is silently dropped. */
-  let foamBlock = '';
+  let foamBlock = '', foamTop = '';
   if (t.kind === 'foam') {
     const fx = t.foam;
+    const fm = S.foam.meta, custom = foamBomIsCustom();
+    const state = fm ? (fm.error ? 'err' : 'ok') : '';
+    foamTop = `<div class="fcwrap dropcard"><div class="blockhead">Memory foam BOM
+        <span class="cnt">SKU Code · Memory Foam RM Code · Qty · Units — one row per foam, so a SKU using several gets several rows</span>
+        ${custom ? '<button class="mini revertbom">Revert to built-in list</button>' : ''}</div>
+      <div class="ugrid">
+        <div class="drop ${state}" id="drop-_foam-bom">
+          <input type="file" accept=".xlsx,.xls,.csv,.tsv" data-v="_foam" data-s="bom" hidden>
+          <div class="dtitle">BOM master sheet</div>
+          ${fm ? (fm.error
+            ? `<div class="dmsg bad">${esc(fm.error)}</div><div class="dfile">${esc(fm.name)}</div>`
+            : `<div class="dmsg good">${money(fm.count)} rows</div>
+               <div class="dfile" title="${esc(fm.name)}">${esc(fm.name)}</div>
+               <div class="dnote">${esc(fm.note || '')}</div>
+               <div class="dstamp">${esc(stampText(fm.at))}</div>`)
+            : `<div class="dmsg">Drop an updated BOM here to replace the built-in list</div>
+               <div class="dnote">Using the built-in list — ${money(Object.keys(FOAM_BOM).length)} SKUs, ${
+                 money(Object.values(FOAM_BOM).reduce((a,v)=>a+v.length,0))} rows</div>`}
+          <button class="imp" data-v="_foam" data-s="bom">${fm && !fm.error ? 'Replace' : 'Import'}</button>
+          ${fm && !fm.error ? dlButtonFor(fm, '_foam', 'bom', 'mini dl') : ''}
+        </div>
+        <div class="bomsrc ${custom ? 'custom' : ''}">
+          <div class="bomsrc-t">${custom ? 'Using your uploaded BOM' : 'Using the built-in BOM'}</div>
+          <div class="bomsrc-s">${custom
+            ? `${money(Object.keys(activeFoamBom()).length)} SKUs in force. The built-in list is still there — revert any time.`
+            : 'Upload a sheet to add SKUs or change quantities without touching the code.'}</div>
+        </div>
+      </div></div>`;
     // No total row here: a SKU with three foams repeats its accepted qty on three
     // rows, and foam units span two units of measure. The rollup above is the
     // authoritative total; this block is the drill-down behind it.
@@ -2330,7 +2427,7 @@ function renderTable() {
     }
     if (fx.idle.length) {
       foamBlock += `<div class="fcwrap"><div class="blockhead">Foam SKUs with no accepted quantity this cycle
-        <span class="cnt">${money(fx.idle.length)} of ${money(Object.keys(FOAM_BOM).length)} BOM SKUs</span></div>
+        <span class="cnt">${money(fx.idle.length)} of ${money(Object.keys(activeFoamBom()).length)} BOM SKUs</span></div>
         <div class="note idlelist">${fx.idle.map(s=>`<span class="chip">${esc(s)}</span>`).join(' ')}</div></div>`;
     }
   }
@@ -2404,7 +2501,7 @@ function renderTable() {
         : 'Upload the confirmed PO sheet above. Its <b>remaining quantity</b> column is what there is to dispatch — until then this list has nothing to show.'}</div>`
     : '';
 
-  $('#tablewrap').innerHTML = dispatchTop + fcBlock + `<div class="blockhead">${
+  $('#tablewrap').innerHTML = foamTop + dispatchTop + fcBlock + `<div class="blockhead">${
       { plan:'ASIN plan', short:'ASINs short of cover — quantity to request from Amazon',
         accept:'Line-level acceptance against unconfirmed POs',
         foam:'Memory foam required against accepted PO quantities, by foam code',
@@ -2453,6 +2550,13 @@ function renderTable() {
       return;
     }
     if (b.classList.contains('dl')) { downloadUpload(b.dataset.v, b.dataset.s); return; }
+    if (b.classList.contains('revertbom')) {
+      if (window.confirm('Go back to the BOM built into the app?\n\nYour uploaded sheet is discarded — re-import it to use it again.')) {
+        S.foam = { bom: null, meta: null };
+        recompute(); render(); saveSession();
+      }
+      return;
+    }
     if (b.classList.contains('src')) {
       const ids = S.active === 'ALL' ? VENDORS.map(v => v.id) : [S.active];
       const done = ids.filter(id => exportAcceptedSheet(id));
@@ -2614,6 +2718,7 @@ function _buildPayload() {
     updated_at: new Date().toISOString(),
     cfg: S.cfg, theme: S.theme, active: S.active,
     shared: { drr: S.shared.drr, meta: S.shared.meta },
+    foam: { bom: S.foam.bom, meta: S.foam.meta },
     vendors: {}
   };
   VENDORS.forEach(v => {
@@ -2635,6 +2740,11 @@ function _applyPayload(p) {
   if (p.shared) {
     if (p.shared.drr)  S.shared.drr  = p.shared.drr;
     if (p.shared.meta) S.shared.meta = p.shared.meta;
+  }
+  // an uploaded BOM master outlives the session that loaded it
+  if (p.foam) {
+    if (p.foam.bom)  S.foam.bom  = p.foam.bom;
+    if (p.foam.meta) S.foam.meta = p.foam.meta;
   }
   Object.keys(p.vendors || {}).forEach(vid => {
     const V = S.vendors[vid]; if (!V) return;
