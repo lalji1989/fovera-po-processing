@@ -199,6 +199,13 @@ td.bandMedium{font-weight:600;color:#b54708;background:rgba(181,71,8,.07)}
 td.bandLow{color:var(--dim)}
 .idlelist{line-height:2;max-height:150px;overflow:auto}
 .uomtot{font-size:11px;white-space:nowrap}
+/* download-the-original button, sits beside Import inside a drop zone */
+.dlbtn,.drop .mini.dl{margin-top:6px;font-size:11px;padding:3px 9px;border-radius:6px;
+  border:1px solid var(--line);background:transparent;color:var(--dim);cursor:pointer}
+.dlbtn:hover,.drop .mini.dl:hover{color:var(--brand);border-color:var(--brand)}
+/* the confirmed-PO drop card on the Dispatch Priority tab */
+.dropcard .ugrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;padding:10px}
+.bignote{padding:18px 16px;line-height:1.6;color:var(--dim);font-size:13px}
 .gname{font-size:11.5px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:380px}
 .gright{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .chip{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:2px 9px;
@@ -937,9 +944,23 @@ function foamConsumption(plan, bom) {
 }
 
 /* ==================== dispatch priority ====================
-   The accept module decides HOW MUCH to take. This decides WHAT SHIPS FIRST.
+   Second step of the cycle, and it answers a different question from PO Accept.
 
-   Bucket is days-of-cover driven, on FC stock on hand over potential DRR:
+   PO Accept works on the UNCONFIRMED dump: how much of what Amazon just asked for
+   should we take. You export that, upload it to Vendor Central, and Amazon folds
+   the accepted quantity into your confirmed POs.
+
+   This tab works on the CONFIRMED dump you download back. Its "remaining quantity"
+   column is the live balance you still owe Amazon — the quantity just accepted plus
+   whatever was already outstanding from earlier POs. That balance, summed per ASIN,
+   is the dispatch quantity: the real number of units to physically ship.
+
+   So `procTot` (this cycle's acceptance) is context only; `openTot` (confirmed
+   remaining) is the figure to act on. Until the confirmed sheet is uploaded there is
+   nothing to dispatch and the tab stays empty, which is the honest answer.
+
+   Bucket is days-of-cover driven, on FC stock on hand over potential DRR — SOH only,
+   deliberately ignoring open POs, because stock in transit does not stop a stockout:
        DOC <= docHigh            -> High
        docHigh < DOC <= docMed   -> Medium
        DOC > docMed              -> Low
@@ -958,8 +979,9 @@ function dispatchPriority(plan, cfg) {
 
   const rows = [];
   plan.forEach(p => {
-    const qty = p.procTot || 0;
-    if (qty <= 0) return;                       // nothing accepted, nothing to dispatch
+    // the balance still owed on confirmed POs — what there is to actually ship
+    const qty = p.openTot || 0;
+    if (qty <= 0) return;                       // nothing outstanding, nothing to dispatch
     const drr = p.drr || 0;
     const doc = drr > 0 ? (p.inventory || 0) / drr : null;
 
@@ -972,21 +994,22 @@ function dispatchPriority(plan, cfg) {
     const urgency = doc == null ? 0 : Math.max(0, Math.min(1, 1 - doc / risk));
 
     const why = [];
-    if (doc != null && doc <= hi)      why.push('Cover ' + dec1(doc) + 'd');
-    else if (doc != null && doc <= med) why.push('Cover ' + dec1(doc) + 'd');
+    if (doc != null && doc <= med)     why.push('Cover ' + dec1(doc) + 'd');
     if (drr <= 0)                      why.push('No DRR');
     if (p.discontinued)                why.push('Discontinued');
     if (p.progressing)                 why.push('Progressing');
-    if ((p.procNow || 0) > 0)          why.push('Amazon Now ' + fmt(p.procNow));
-    if ((p.openTot || 0) > 0)          why.push('Open PO ' + fmt(p.openTot));
+    if ((p.openNow || 0) > 0)          why.push('Amazon Now ' + fmt(p.openNow));
+    if ((p.procTot || 0) > 0)          why.push('Accepted this cycle ' + fmt(p.procTot));
     if (riskValue > 0)                 why.push('At risk ' + Math.round(riskValue).toLocaleString('en-IN'));
 
     rows.push({
       asin: p.asin, sku: p.sku, name: p.name, vendorCode: p.vendorCode || '',
-      drr, inventory: p.inventory || 0, openTot: p.openTot || 0,
+      drr, inventory: p.inventory || 0,
       docSoh: doc, band,
-      procTot: qty, procReg: p.procReg || 0, procNow: p.procNow || 0,
-      cost, acceptValue: qty * cost,
+      // dispatchQty is the confirmed-PO balance; openReg/openNow split it by channel
+      dispatchQty: qty, openReg: p.openReg || 0, openNow: p.openNow || 0,
+      procTot: p.procTot || 0,                  // this cycle's acceptance, context only
+      cost, dispatchValue: qty * cost,
       shortDays, riskUnits, riskValue, urgency,
       discontinued: !!p.discontinued, progressing: !!p.progressing,
       status: p.status || '', why: why.join(' · ')
@@ -1000,7 +1023,7 @@ function dispatchPriority(plan, cfg) {
     const valueN = maxRisk > 0 ? r.riskValue / maxRisk : 0;
     let s = 100 * (0.6 * r.urgency + 0.4 * valueN);
     if (r.discontinued) s *= 0.25;              // dead stock never jumps the queue
-    if ((r.procNow || 0) > 0) s *= 1.15;        // Amazon Now carries the tighter SLA
+    if ((r.openNow || 0) > 0) s *= 1.15;        // Amazon Now carries the tighter SLA
     r.score = Math.round(Math.max(0, Math.min(100, s)) * 10) / 10;
   });
 
@@ -1012,6 +1035,46 @@ function dispatchPriority(plan, cfg) {
   rows.forEach((r, i) => { r.rank = i + 1; });
   return rows;
 }
+
+/* The pick list. One line per SKU with the total units to ship, because the
+   warehouse packs by SKU, not by ASIN. Usually 1:1, but where one SKU carries
+   several ASINs their quantities belong on one line rather than two — and the
+   ASIN count is shown so a combined row is never silently combined.
+   Band is the most urgent of the SKU's ASINs: if any part of it is running out,
+   the whole SKU is worth pulling forward. */
+function dispatchBySku(rows) {
+  const m = new Map();
+  const worst = { High: 0, Medium: 1, Low: 2 };
+  rows.forEach(r => {
+    const k = (r.sku || '').trim().toUpperCase() || ('ASIN:' + r.asin);
+    if (!m.has(k)) m.set(k, {
+      sku: r.sku || '(no SKU)', name: r.name, vendorCode: r.vendorCode,
+      dispatchQty: 0, openReg: 0, openNow: 0, procTot: 0, dispatchValue: 0,
+      riskValue: 0, inventory: 0, drr: 0,
+      band: r.band, docSoh: r.docSoh, score: r.score, asins: 0, asinList: []
+    });
+    const g = m.get(k);
+    g.dispatchQty   += r.dispatchQty;
+    g.openReg       += r.openReg;
+    g.openNow       += r.openNow;
+    g.procTot       += r.procTot;
+    g.dispatchValue += r.dispatchValue;
+    g.riskValue     += r.riskValue;
+    g.inventory     += r.inventory;
+    g.drr           += r.drr;
+    g.asins++; g.asinList.push(r.asin);
+    if (worst[r.band] < worst[g.band]) g.band = r.band;
+    if (r.docSoh != null && (g.docSoh == null || r.docSoh < g.docSoh)) g.docSoh = r.docSoh;
+    if (r.score > g.score) g.score = r.score;
+  });
+  const out = [...m.values()].map(g => ({ ...g, asinList: g.asinList.join(', ') }));
+  out.sort((a, b) => worst[a.band] - worst[b.band]
+                  || b.score - a.score
+                  || b.dispatchQty - a.dispatchQty
+                  || String(a.sku).localeCompare(String(b.sku)));
+  out.forEach((r, i) => { r.rank = i + 1; });
+  return out;
+}
 function dec1(n) { return (n == null || !isFinite(n)) ? '-' : Number(n).toFixed(1); }
 
 const CALC =
@@ -1019,7 +1082,7 @@ const CALC =
     splitDRR, resolveVendor,
     pickSheet, headerScore, PO_COLS, DRR_COLS, INV_COLS,
     dispatchBudgets, acceptBudgets, parseDate, num, norm,
-    foamConsumption, dispatchPriority, foamKey };
+    foamConsumption, dispatchPriority, dispatchBySku, foamKey };
 </script>
 <script>/* ==================== state ==================== */
 const VENDORS = [
@@ -1259,11 +1322,35 @@ function readSheet(file, slot) {
         const best = CALC.pickSheet(sheets, wantedFor(slot));
         if (!best || best.score < 2)
           throw new Error('No sheet with the expected columns. Tabs seen: ' + wb.SheetNames.join(', '));
-        res({ rows: best.rows, sheet: best.name });
+        // hand the raw bytes back too, so the original file can be re-downloaded later
+        res({ rows: best.rows, sheet: best.name, buf: e.target.result });
       } catch (err) { rej(err); }
     };
     fr.readAsArrayBuffer(file);
   });
+}
+
+/* Keep the bytes of whatever was dropped in, so the exact file can be handed back
+   later — useful when you need to re-upload to Vendor Central or check what a figure
+   was computed from. Structured clone stores an ArrayBuffer in IndexedDB as-is, so
+   this survives a refresh along with the rest of the session. Very large files are
+   skipped: the parsed rows are what the app actually needs, and a 25 MB blob in the
+   session would slow every save. */
+const KEEP_FILE_MAX = 12 * 1024 * 1024;   // 12 MB
+function fileBlobFrom(file, buf) {
+  if (!buf || buf.byteLength > KEEP_FILE_MAX) return null;
+  return { name: file.name, type: file.type || '', size: buf.byteLength, buf };
+}
+function downloadStoredFile(meta) {
+  if (!meta || !meta.file || !meta.file.buf) return false;
+  const f = meta.file;
+  const blob = new Blob([f.buf], { type: f.type || 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = f.name || 'upload';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return true;
 }
 
 async function handleFiles(vendorId, slot, files) {
@@ -1273,12 +1360,13 @@ async function handleFiles(vendorId, slot, files) {
   const box = $(`#drop-${vendorId}-${slot}`);
   if (box) box.classList.add('busy');
   try {
-    const { rows, sheet } = await readSheet(files[0], slot);
+    const { rows, sheet, buf } = await readSheet(files[0], slot);
+    const kept = fileBlobFrom(files[0], buf);
     if (shared) {
       const r = CALC.parseDRR(rows);
       if (!r.lines.length) throw new Error('No ASIN rows found. Expected columns ASIN, SKU, DRR and a vendor column.');
       S.shared.drr = r;
-      S.shared.meta = { name: files[0].name, sheet, count: r.lines.length, at: stamp() };
+      S.shared.meta = { name: files[0].name, sheet, count: r.lines.length, at: stamp(), file: kept };
     } else {
       const V = S.vendors[vendorId];
       let parsed, note = '', hdr = null, accIdx = -1;
@@ -1290,7 +1378,7 @@ async function handleFiles(vendorId, slot, files) {
       if (!parsed.length) throw new Error('No usable rows found. Check the sheet has the standard Amazon headers.');
       V.raw[slot] = parsed;
       V.meta[slot] = { name: files[0].name, sheet, count: parsed.length, note, at: new Date(),
-                       header: hdr, acceptedIdx: accIdx };
+                       header: hdr, acceptedIdx: accIdx, file: kept };
     }
     recompute(); render(); saveSession();
   } catch (err) {
@@ -1445,25 +1533,41 @@ const COLS = {
     { k:'procNow', t:'Accept Now', f:money, tone:'now' },
     { k:'name', t:'Product', cls:'txt dim wide' }
   ],
-  /* dispatch priority */
+  /* dispatch priority — per ASIN. Quantity is the confirmed-PO balance. */
   priority: [
     { k:'vendor_', t:'Vendor', cls:'txt', all:true },
     { k:'rank', t:'#', f:money, cls:'nm dim' },
     { k:'band', t:'PRIORITY', cls:'txt', tone:'band' },
     { k:'sku', t:'SKU', cls:'txt mono skucell', tone:'key' },
     { k:'asin', t:'ASIN', cls:'txt mono dim' },
-    { k:'procTot', t:'DISPATCH QTY', f:money, tone:'key' },
+    { k:'dispatchQty', t:'DISPATCH QTY', f:money, tone:'key' },
+    { k:'openReg', t:'Regular', f:money, cls:'nm dim' },
+    { k:'openNow', t:'Amazon Now', f:money, tone:'now' },
     { k:'docSoh', t:'DOC (days)', f:v=>dec(v,1), tone:'key2' },
     { k:'drr', t:'DRR', f:v=>dec(v,2) },
     { k:'inventory', t:'FC Stock', f:money },
-    { k:'openTot', t:'Open PO', f:money, cls:'nm dim' },
     { k:'shortDays', t:'Days Short', f:v=>dec(v,1), cls:'nm dim' },
     { k:'riskUnits', t:'Units at Risk', f:v=>money(Math.round(v)) },
     { k:'riskValue', t:'VALUE AT RISK', f:inrFull, tone:'key2' },
     { k:'score', t:'Score', f:v=>dec(v,1) },
-    { k:'procNow', t:'Of which Now', f:money, tone:'now' },
-    { k:'acceptValue', t:'Accepted Value', f:inrFull, cls:'nm dim' },
+    { k:'procTot', t:'Accepted this cycle', f:money, cls:'nm dim' },
+    { k:'dispatchValue', t:'Dispatch Value', f:inrFull, cls:'nm dim' },
     { k:'why', t:'Why', cls:'txt dim wide' }
+  ],
+  /* dispatch priority — the pick list, one line per SKU */
+  prioritySku: [
+    { k:'rank', t:'#', f:money, cls:'nm dim' },
+    { k:'band', t:'PRIORITY', cls:'txt', tone:'band' },
+    { k:'sku', t:'SKU', cls:'txt mono skucell', tone:'key' },
+    { k:'dispatchQty', t:'TOTAL DISPATCH QTY', f:money, tone:'key' },
+    { k:'openReg', t:'Regular', f:money, cls:'nm dim' },
+    { k:'openNow', t:'Amazon Now', f:money, tone:'now' },
+    { k:'docSoh', t:'DOC (days)', f:v=>dec(v,1), tone:'key2' },
+    { k:'inventory', t:'FC Stock', f:money },
+    { k:'riskValue', t:'Value at Risk', f:inrFull },
+    { k:'dispatchValue', t:'Dispatch Value', f:inrFull, cls:'nm dim' },
+    { k:'asins', t:'ASINs', f:money, cls:'nm dim' },
+    { k:'name', t:'Product', cls:'txt dim wide' }
   ]
 };
 
@@ -1504,6 +1608,8 @@ function sharedCard() {
       <input type="file" accept=".xlsx,.xls,.csv,.tsv" data-v="_shared" data-s="drr" hidden>
       <div class="dtitle">DRR — all vendors</div>${detail}
       <button class="imp" data-v="_shared" data-s="drr">${m && !m.error ? 'Replace' : 'Import'}</button>
+      ${m && !m.error && m.file ? `<button class="dlbtn" data-v="_shared" data-s="drr"
+          title="Download the file exactly as it was uploaded">Download</button>` : ''}
     </div></div></div>`;
 }
 
@@ -1544,6 +1650,8 @@ function renderUploads() {
                  ${m.note ? `<div class="dnote">${esc(m.note)}</div>` : ''}`)
             : `<div class="dmsg">${esc(s.hint)}</div>`}
           <button class="imp" data-v="${vid}" data-s="${s.id}">${m && !m.error ? 'Replace' : 'Import'}</button>
+          ${m && !m.error && m.file ? `<button class="dlbtn" data-v="${vid}" data-s="${s.id}"
+              title="Download the file exactly as it was uploaded">Download</button>` : ''}
         </div>`;
       }).join('')}</div></div>`;
   }).join('');
@@ -1555,6 +1663,13 @@ function renderUploads() {
     e.preventDefault();
     const box = document.getElementById(`drop-${b.dataset.v}-${b.dataset.s}`);
     box.querySelector('input[type=file]').click();
+  });
+  // hand back the original upload, byte for byte
+  $$('#uploads .dlbtn').forEach(b => b.onclick = e => {
+    e.preventDefault(); e.stopPropagation();
+    const meta = b.dataset.v === '_shared' ? S.shared.meta : S.vendors[b.dataset.v].meta[b.dataset.s];
+    if (!downloadStoredFile(meta))
+      alert('The original file is not held for this upload — re-import it to enable the download.');
   });
   $$('#uploads .drop').forEach(d => {
     d.ondragover = e => { e.preventDefault(); d.classList.add('over'); };
@@ -1770,7 +1885,7 @@ function makeTest(expr, isNumeric) {
 
 const NUM_KEYS = ['drr','docSoh','docPo','daysCover','urgency','priority','priorityRaw','rank','pct',
                   'foamQty','perUnit','units','skus','score','riskUnits','riskValue','acceptValue',
-                  'shortDays','cost'];
+                  'shortDays','cost','dispatchQty','dispatchValue','asins'];
 function isNumericCol(c) { return c.f === money || NUM_KEYS.includes(c.k); }
 
 function activeFilters() { return S.filters[S.view] || (S.filters[S.view] = {}); }
@@ -1809,7 +1924,7 @@ function currentTable() {
              skuCols: COLS.foamSku.filter(c => !c.all || S.active === 'ALL') };
   }
 
-  /* Dispatch priority: given what we accepted, what ships first. */
+  /* Dispatch priority: what to ship, against the confirmed-PO balance. */
   if (S.view === 'priority') {
     let plan = [];
     vids.forEach(vid => S.vendors[vid].plan.forEach(p =>
@@ -1818,7 +1933,13 @@ function currentTable() {
     // dispatchPriority drops vendor_, so re-attach from the plan it was built off
     const vmap = new Map(plan.map(p => [p.asin, p.vendor_]));
     rows.forEach(r => { r.vendor_ = vmap.get(r.asin) || ''; });
-    return { cols: COLS.priority, rows, kind:'priority' };
+    // has a confirmed sheet been uploaded at all? drives the empty-state message
+    const hasConfirmed = vids.some(vid => (S.vendors[vid].raw.confirmed || []).length > 0);
+    // The SKU pick list is what the warehouse acts on, so it leads; the ASIN-level
+    // priority detail sits underneath it.
+    return { cols: COLS.prioritySku, rows: CALC.dispatchBySku(rows), kind:'priority',
+             asinRows: rows, asinCols: COLS.priority.filter(c => !c.all || S.active === 'ALL'),
+             hasConfirmed, vids };
   }
 
   if (S.view === 'plan') {
@@ -2077,7 +2198,7 @@ function renderTable() {
   const t = currentTable();
   const q = S.q.trim().toLowerCase();
   let rows = t.rows;
-  if (q) rows = rows.filter(r => ['asin','sku','po','fc','name','vendor_','remarks','rm','band','why','skuList']
+  if (q) rows = rows.filter(r => ['asin','sku','po','fc','name','vendor_','remarks','rm','band','why','skuList','asinList','vendorCode']
     .some(k => String(r[k] || '').toLowerCase().includes(q)));
   if (S.sort.col) {
     const c = S.sort.col, d = S.sort.dir;
@@ -2113,6 +2234,44 @@ function renderTable() {
   if (t.poRows) fcBlock += summaryBlock(t.poRows, t.poCols, 'Qty to accept, by purchase order', 'po');
   if (t.fcRows) fcBlock += summaryBlock(t.fcRows, t.fcCols, 'Qty to accept, by fulfilment centre', 'fc');
 
+  /* Dispatch priority: the SKU pick list leads, because that is what the warehouse
+     works from; the ASIN detail sits under it. A dedicated drop zone for the
+     confirmed PO sheet lives on this tab, since re-uploading it is step two of the
+     cycle and you should not have to hunt for the panel above. */
+  let dispatchBlock = '', dispatchTop = '';
+  if (t.kind === 'priority') {
+    dispatchTop = `<div class="fcwrap dropcard"><div class="blockhead">Confirmed PO sheet
+        <span class="cnt">Vendor Central export, Status = Confirmed — its remaining quantity is the dispatch quantity</span></div>
+      <div class="ugrid">${t.vids.map(vid => {
+        const m = S.vendors[vid].meta.confirmed;
+        const state = m ? (m.error ? 'err' : 'ok') : '';
+        return `<div class="drop ${state}" id="drop-${vid}-confirmed">
+          <input type="file" accept=".xlsx,.xls,.csv,.tsv" data-v="${vid}" data-s="confirmed" hidden>
+          <div class="dtitle">${esc(S.vendors[vid].label)}</div>
+          ${m ? (m.error
+            ? `<div class="dmsg bad">${esc(m.error)}</div><div class="dfile">${esc(m.name)}</div>`
+            : `<div class="dmsg good">${money(m.count)} rows</div>
+               <div class="dfile" title="${esc(m.name)}">${esc(m.name)}</div>
+               <div class="dstamp">${esc(stampText(m.at))}</div>
+               ${(() => { const f = freshness(m.at);
+                  return f ? `<span class="freshtag ${f.cls}">${f.text}</span>` : ''; })()}`)
+            : '<div class="dmsg">Drop the confirmed PO export here</div>'}
+          <button class="imp" data-v="${vid}" data-s="confirmed">${m && !m.error ? 'Replace' : 'Import'}</button>
+          ${m && !m.error && m.file ? `<button class="mini dl" data-v="${vid}" data-s="confirmed">Download</button>` : ''}
+        </div>`;
+      }).join('')}</div></div>`;
+
+    if (t.asinRows.length) {
+      const consolidated = t.asinRows.length - t.rows.length;
+      dispatchBlock = summaryBlock(t.asinRows, t.asinCols,
+        'Dispatch priority by ASIN' + (consolidated > 0
+          ? ` — ${money(consolidated)} row${consolidated>1?'s':''} folded into the SKU list above`
+          : ''),
+        'prioasin',
+        ['dispatchQty','openReg','openNow','procTot','riskUnits','riskValue','dispatchValue','inventory']);
+    }
+  }
+
   /* Memory foam: the SKU x component expansion sits under the foam-code rollup,
      plus the two exception lists so nothing is silently dropped. */
   let foamBlock = '';
@@ -2142,7 +2301,7 @@ function renderTable() {
 
   const SUMMABLE = ['procTot','poReq','allocated','lineQty','balance','procReg','procNow',
                     'uncReg','uncNow','openTot','openReg','openNow','inventory',
-                    'foamQty','riskUnits','riskValue','acceptValue'];
+                    'foamQty','riskUnits','riskValue','dispatchQty','dispatchValue'];
   /* On the foam rollup, `skus` and `units` count the same finished unit once per
      component, so a SKU drawing three foams would be counted three times. Only the
      foam quantity is genuinely additive — and then only within one unit of measure. */
@@ -2188,7 +2347,7 @@ function renderTable() {
     return `<td class="${c.cls||'nm'} ${c.tone||''}${extra}">${v}</td>`;
   }).join('')}</tr>`).join('');
   // money columns must total in rupees, not as a bare count
-  const CURRENCY = ['riskValue','acceptValue','poReqValue'];
+  const CURRENCY = ['riskValue','dispatchValue','poReqValue'];
   const foot = totals.some(x => x !== null)
     ? `<tr class="totrow">${cols.map((c,i) => {
         if (i === 0) return '<td class="txt">TOTAL</td>';
@@ -2201,11 +2360,19 @@ function renderTable() {
   const bandCount = t.kind === 'priority'
     ? ['High','Medium','Low'].map(b => `${b} ${money(rows.filter(r=>r.band===b).length)}`).join(' · ') : '';
 
-  $('#tablewrap').innerHTML = fcBlock + `<div class="blockhead">${
+  /* Nothing to dispatch is two different situations and they need different answers:
+     no confirmed sheet uploaded yet, versus uploaded but nothing outstanding. */
+  const emptyNote = (t.kind === 'priority' && !rows.length)
+    ? `<div class="note bignote">${t.hasConfirmed
+        ? 'The confirmed PO sheet is loaded, but no ASIN has a remaining quantity — nothing is outstanding to dispatch.'
+        : 'Upload the confirmed PO sheet above. Its <b>remaining quantity</b> column is what there is to dispatch — until then this list has nothing to show.'}</div>`
+    : '';
+
+  $('#tablewrap').innerHTML = dispatchTop + fcBlock + `<div class="blockhead">${
       { plan:'ASIN plan', short:'ASINs short of cover — quantity to request from Amazon',
         accept:'Line-level acceptance against unconfirmed POs',
         foam:'Memory foam required against accepted PO quantities, by foam code',
-        priority:'Dispatch priority — what to ship first from the accepted quantities'
+        priority:'Dispatch list — total quantity to ship per SKU, most urgent first'
       }[t.kind === 'line' ? S.view : t.kind]
     }<span class="cnt">${money(rows.length)} rows${preFilter !== rows.length ? ` of ${money(preFilter)}` : ''}</span>
     ${bandCount ? `<span class="acctot">${bandCount}</span>` : ''}
@@ -2214,16 +2381,47 @@ function renderTable() {
     ${filterCount() ? `<button class="mini clr">Clear ${filterCount()} filter${filterCount()>1?'s':''}</button>` : ''}
     <button class="mini" data-exp="main">Export CSV</button></div>
     <div class="scroll"><table class="tbl"><thead>${head}</thead><tbody>${body}${foot}</tbody></table></div>
+    ${emptyNote}
     ${rows.length > 3000 ? '<div class="note">Showing first 3,000 rows — export the CSV for the full list.</div>' : ''}`
-    + foamBlock;
+    + foamBlock + dispatchBlock;
 
   $$('#tablewrap th[data-sort]').forEach(th => th.onclick = () => {
     const k = th.dataset.sort;
     S.sort = { col: k, dir: S.sort.col === k ? -S.sort.dir : -1 };
     renderTable();
   });
+  // the confirmed-PO drop zone rendered on the Dispatch Priority tab
+  $$('#tablewrap .dropcard input[type=file]').forEach(inp => {
+    inp.onchange = e => handleFiles(inp.dataset.v, inp.dataset.s, e.target.files);
+  });
+  $$('#tablewrap .dropcard .imp').forEach(b => b.onclick = e => {
+    e.preventDefault();
+    document.getElementById(`drop-${b.dataset.v}-${b.dataset.s}`)
+            .querySelector('input[type=file]').click();
+  });
+  $$('#tablewrap .dropcard .drop').forEach(d => {
+    d.ondragover  = e => { e.preventDefault(); d.classList.add('over'); };
+    d.ondragleave = () => d.classList.remove('over');
+    d.ondrop = e => {
+      e.preventDefault(); d.classList.remove('over');
+      const inp = d.querySelector('input');
+      handleFiles(inp.dataset.v, inp.dataset.s, e.dataTransfer.files);
+    };
+  });
+
   $$('#tablewrap .mini').forEach(b => b.onclick = () => {
     if (b.classList.contains('clr')) { S.filters[S.view] = {}; renderTable(); return; }
+    if (b.classList.contains('imp')) {
+      document.getElementById(`drop-${b.dataset.v}-${b.dataset.s}`)
+              .querySelector('input[type=file]').click();
+      return;
+    }
+    if (b.classList.contains('dl')) {
+      const V = S.vendors[b.dataset.v];
+      if (!downloadStoredFile(V && V.meta[b.dataset.s]))
+        alert('The original file is not held for this upload — re-import it to enable the download.');
+      return;
+    }
     if (b.classList.contains('src')) {
       const ids = S.active === 'ALL' ? VENDORS.map(v => v.id) : [S.active];
       const done = ids.filter(id => exportAcceptedSheet(id));
@@ -2233,6 +2431,7 @@ function renderTable() {
     if (b.dataset.exp === 'fc') exportCSV(t.fcCols, t.fcRows, 'accept-by-fc');
     else if (b.dataset.exp === 'po') exportCSV(t.poCols, t.poRows, 'accept-by-po');
     else if (b.dataset.exp === 'poreq') exportPORequest(rows);
+    else if (b.dataset.exp === 'prioasin') exportCSV(t.asinCols, t.asinRows, 'dispatch-priority-by-asin');
     else if (b.dataset.exp === 'foamsku')  exportCSV(t.skuCols, t.skuRows, 'memory-foam-by-sku');
     else if (b.dataset.exp === 'foamnone') exportCSV(
       [{k:'sku',t:'SKU'},{k:'asin',t:'ASIN'},{k:'procTot',t:'Accepted Qty'},{k:'name',t:'Product'}],
