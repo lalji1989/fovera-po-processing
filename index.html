@@ -2265,6 +2265,33 @@ function renderAcceptView() {
   $$('#tablewrap td.acc').forEach(td => td.ondblclick = () => editQty(td));
 }
 
+function keepScroll(fn, anchor) {
+  // Re-rendering replaces #tablewrap wholesale, which would otherwise throw the
+  // user back to the top of the table every time they edit a quantity.
+  const box = document.querySelector('#tablewrap .scroll');
+  const top = box ? box.scrollTop : 0, left = box ? box.scrollLeft : 0;
+  const wy = window.scrollY, wx = window.scrollX;
+  // Where the edited cell sat on screen, so a KPI block changing height above the
+  // table does not nudge the row the user is working on.
+  const sel = anchor ? `#tablewrap td.acc[data-vid="${anchor.dataset.vid}"][data-i="${anchor.dataset.i}"]` : null;
+  const wasAt = sel ? anchor.getBoundingClientRect().top : null;
+  fn();
+  const restore = () => {
+    const b = document.querySelector('#tablewrap .scroll');
+    if (b) { b.scrollTop = top; b.scrollLeft = left; }
+    window.scrollTo(wx, wy);
+    if (sel) {
+      const again = document.querySelector(sel);
+      if (again) {
+        const drift = again.getBoundingClientRect().top - wasAt;
+        if (Math.abs(drift) > 1) window.scrollBy(0, drift);
+      }
+    }
+  };
+  restore();
+  requestAnimationFrame(restore);
+}
+
 function editQty(td) {
   if (td.querySelector('input')) return;
   const vid = td.dataset.vid, i = +td.dataset.i, max = +td.dataset.max;
@@ -2288,8 +2315,9 @@ function editQty(td) {
       // a setting like target days would no longer move that line.
       if (base != null && v === base) V.overrides.delete(i);
       else V.overrides.set(i, v);
-      recompute(); render(); saveSession();
-    } else renderTable();
+      keepScroll(() => { recompute(); render(); }, td);
+      saveSession();
+    } else keepScroll(renderTable, td);
   };
   inp.onblur = () => commit(true);
   inp.onkeydown = e => {
